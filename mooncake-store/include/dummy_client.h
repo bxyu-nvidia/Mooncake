@@ -164,6 +164,8 @@ class DummyClient : public PyClient {
 
     long removeAll(bool force = false);
 
+    std::vector<int> batchRetire(const std::vector<std::string> &keys) override;
+
     std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                  bool force = false);
 

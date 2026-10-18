@@ -102,6 +102,15 @@ TEST(CacheInventoryTest, OldLayoutsStillWorkAndEmptyCategoriesExportZero) {
     EXPECT_EQ(counts.at("mamba.retired.ready_bytes"), 0U);
 }
 
+TEST(CacheInventoryTest, MasterRetirementSurvivesMissingMarkerObjects) {
+    CacheInventoryAccumulator inventory({{"model", "m", "mamba"}});
+    inventory.Add("m@hash", 1024, true, true);
+    const auto counts = inventory.Finish().counts;
+    EXPECT_EQ(counts.at("mamba.retired.complete_prefixes"), 1U);
+    EXPECT_EQ(counts.at("mamba.retired.ready_bytes"), 1024U);
+    EXPECT_EQ(counts.at("mamba.anchor_or_unknown.complete_prefixes"), 0U);
+}
+
 TEST(CacheInventoryTest, MarkerNamespaceRequiresMatchingPayloadScope) {
     const std::vector<CacheInventoryNamespace> invalid{
         {"model", "m0", "mamba"}, {"other", "retired", "mamba_retired"}};

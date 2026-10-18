@@ -3373,6 +3373,15 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return result;
 }
 
+std::vector<tl::expected<void, ErrorCode>> Client::BatchRetire(
+    const std::vector<ObjectKey>& keys) {
+    if (hot_cache_) {
+        hot_cache_->BumpKeyGenerations(keys);
+        hot_cache_->RemoveHotKeys(keys);
+    }
+    return master_client_.BatchRetire(keys);
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
     if (hot_cache_) {

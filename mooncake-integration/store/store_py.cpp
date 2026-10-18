@@ -2368,6 +2368,17 @@ PYBIND11_MODULE(store, m) {
             "Remove all objects from the store. If force=True, skip lease "
             "and replication task checks.")
         .def(
+            "batch_retire",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                py::gil_scoped_release release;
+                return self.store_->batchRetire(keys);
+            },
+            py::arg("keys"),
+            "Stop new master lookups and asynchronously reclaim objects after "
+            "existing read leases drain. Returns per-key status codes; "
+            "0 means retirement accepted, not necessarily deleted.")
+        .def(
             "batch_remove",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys, bool force) {

@@ -784,7 +784,7 @@ CacheInventorySnapshot MasterService::GetCacheInventory(
             bool ready = false;
             metadata.VisitReplicas(&Replica::fn_is_completed,
                                    [&](const Replica&) { ready = true; });
-            inventory.Add(key, metadata.size, ready);
+            inventory.Add(key, metadata.size, ready, metadata.retired);
         }
     }
     auto result = inventory.Finish();
@@ -2189,6 +2189,9 @@ MasterService::EraseMetadata(
     if (metadata.GetCommittedSoftPinTimeout()) {
         soft_pin_deadline_index_.Remove(tenant_id.MakeScopedKey(key));
     }
+    if (metadata.retired) {
+        retirement_deadline_index_.Remove(tenant_id.MakeScopedKey(key));
+    }
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
             if (enable_multi_tenants_ &&
@@ -2331,10 +2334,13 @@ void MasterService::SoftPinDeadlineIndex::RemoveIfMatches(
 }
 
 std::vector<MasterService::SoftPinDeadlineIndex::Entry>
-MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now) {
+MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now,
+                                                size_t limit) {
     std::vector<Entry> expired;
     std::lock_guard lock(mutex_);
-    while (!heap_.empty() && heap_.top().deadline <= now) {
+    size_t popped = 0;
+    while (!heap_.empty() && heap_.top().deadline <= now && popped < limit) {
+        ++popped;
         Entry entry = heap_.top();
         heap_.pop();
 
@@ -3273,6 +3279,14 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     standby_meta.hard_pinned.value_or(false),
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
+            if (standby_meta.retired.value_or(false)) {
+                auto& metadata = tenant_state.metadata.at(object.user_key);
+                metadata.GrantReadLease(default_kv_lease_ttl_);
+                metadata.retired = true;
+                retirement_deadline_index_.Upsert(
+                    object.tenant_id.MakeScopedKey(object.user_key), shard_idx,
+                    metadata.lease_timeout);
+            }
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, object.tenant_id,
                                     object.user_key, standby_meta.group_id);
@@ -3593,6 +3607,7 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
+    if (metadata.retired) return false;
     return metadata.HasReplica(
         [this](const Replica& replica) { return IsReplicaReadable(replica); });
 }
@@ -3627,7 +3642,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
             continue;
         }
         for (const auto& [key, metadata] : tenant_it->second.metadata) {
-            if (std::regex_search(key, pattern)) {
+            if (!metadata.retired && std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
                     [this](const Replica& replica) {
@@ -3672,6 +3687,9 @@ auto MasterService::GetReplicaList(const std::string& key,
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         const auto& metadata = accessor.Get();
+        if (metadata.retired) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
 
         std::vector<Replica::Descriptor> replica_list;
         metadata.VisitReplicas(
@@ -3857,7 +3875,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 const auto& tenant_state = tenant_it->second;
                 const auto metadata_it = tenant_state.metadata.find(key);
                 if (metadata_it == tenant_state.metadata.end() ||
-                    !metadata_it->second.IsValid()) {
+                    !metadata_it->second.IsValid() ||
+                    metadata_it->second.retired) {
                     VLOG(1) << "key=" << key << ", info=object_not_found";
                     results[original_idx] =
                         tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -5095,6 +5114,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             }
 
             auto it = tenant_state.metadata.find(key);
+            if (it != tenant_state.metadata.end() && it->second.retired) {
+                return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+            }
 
             // --- Step 0: stale handle cleanup ---
             if (it != tenant_state.metadata.end()) {
@@ -6792,6 +6814,109 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             << ", total_freed_size=" << total_freed_size
             << ", signaled_clients=" << clients_with_disk_replicas.size();
     return removed_count;
+}
+
+std::vector<tl::expected<void, ErrorCode>> MasterService::BatchRetire(
+    const std::vector<std::string>& keys, const TenantId& tenant_id) {
+    const auto& tenant = ResolveRequestTenantId(tenant_id);
+    std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& key = keys[i];
+        MetadataAccessorRW accessor(this, MakeObjectIdentity(key, tenant));
+        if (!accessor.Exists()) {
+            results[i] = tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            continue;
+        }
+        auto& metadata = accessor.Get();
+        if (metadata.retired) continue;
+        // No writer may still be publishing or replacing this object.
+        if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
+            results[i] = tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+            continue;
+        }
+        metadata.retired = true;
+        if (enable_oplog_) {
+            auto persisted = AppendOpLogVisibleBeforeDurable(
+                OpType::PUT_END, tenant.value(), key,
+                SerializeMetadataForOpLog(metadata));
+            if (!persisted) {
+                metadata.retired = false;
+                results[i] = tl::make_unexpected(persisted.error());
+                continue;
+            }
+        }
+        // The exclusive shard lock serializes this transition with all lease
+        // grants, including group refreshes. Do not extend the existing lease.
+        retirement_deadline_index_.Upsert(tenant.MakeScopedKey(key),
+                                          GetMetadataShardIndex(metadata),
+                                          metadata.lease_timeout);
+    }
+    return results;
+}
+
+void MasterService::CleanupRetiredObjects(
+    std::chrono::system_clock::time_point now) {
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    // Bound maintenance work independently of the number of retired objects.
+    for (const auto& entry : retirement_deadline_index_.PopExpired(now, 1024)) {
+        const auto [tenant_id, key] =
+            TenantId::ParseScopedKey(entry.scoped_key);
+        MetadataShardAccessorRW shard(this, entry.shard_idx);
+        auto tenant_it = shard->tenants.find(tenant_id);
+        if (tenant_it == shard->tenants.end()) continue;
+        auto& tenant = tenant_it->second;
+        auto it = tenant.metadata.find(key);
+        if (it == tenant.metadata.end() || !it->second.retired) continue;
+        auto& metadata = it->second;
+        if (!metadata.IsLeaseExpired(now) ||
+            !metadata.AllReplicas([](const Replica& replica) {
+                return replica.is_completed() && replica.get_refcnt() == 0;
+            }) ||
+            tenant.replication_tasks.contains(key) ||
+            tenant.offloading_tasks.contains(key)) {
+            retirement_deadline_index_.Upsert(entry.scoped_key, entry.shard_idx,
+                                              now + std::chrono::seconds(1));
+            continue;
+        }
+        if (enable_ha_ && enable_oplog_) {
+            auto reservation = ReserveBatchOpLogSlot();
+            if (!reservation) {
+                retirement_deadline_index_.Upsert(
+                    entry.scoped_key, entry.shard_idx,
+                    now + std::chrono::seconds(1));
+                continue;
+            }
+            std::vector<ReplicaID> removed_ids;
+            metadata.VisitReplicas(
+                &Replica::fn_is_completed,
+                [&](Replica& replica) { removed_ids.push_back(replica.id()); });
+            auto persisted = AppendReservedOpLogWithDurableFinalize(
+                std::move(reservation.value()), OpType::REMOVE,
+                tenant_id.value(), key, {},
+                [this, removed_ids =
+                           std::move(removed_ids)](const OpLogEntry& durable) {
+                    FinalizeRemovedReplicasAfterDurable(durable, removed_ids,
+                                                        QuotaEraseMode::kFull);
+                });
+            if (!persisted) {
+                LOG(ERROR) << "Retired object removal persistence failed: "
+                           << key;
+                retirement_deadline_index_.Upsert(
+                    entry.scoped_key, entry.shard_idx,
+                    now + std::chrono::seconds(1));
+            } else {
+                // The durable callback takes this shard lock, so it cannot run
+                // until the successfully queued replicas are marked removed.
+                metadata.VisitReplicas(
+                    &Replica::fn_is_completed,
+                    [](Replica& replica) { replica.mark_removed(); });
+            }
+            continue;
+        }
+        EraseMetadata(tenant, it, tenant_id, QuotaEraseMode::kFull, &shard);
+        if (tenant.Empty()) shard->tenants.erase(tenant_it);
+    }
 }
 
 auto MasterService::BatchRemove(const std::vector<std::string>& keys,
@@ -9085,8 +9210,14 @@ void MasterService::EvictionThreadFunc() {
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_retirement_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
+        if (std::chrono::steady_clock::now() >= next_retirement_time) {
+            CleanupRetiredObjects(now);
+            next_retirement_time =
+                std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        }
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
@@ -11629,6 +11760,7 @@ MasterService::MetadataSerializer::Deserialize(
 
 void MasterService::MetadataSerializer::Reset() {
     service_->soft_pin_deadline_index_.Clear();
+    service_->retirement_deadline_index_.Clear();
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
     }
@@ -11777,6 +11909,13 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.object_checksum = metadata_ptr->object_checksum;
+        it->second.retired = metadata_ptr->retired;
+        if (it->second.retired) {
+            service_->retirement_deadline_index_.Upsert(
+                tenant_id.MakeScopedKey(user_key),
+                service_->GetMetadataShardIndex(it->second),
+                it->second.lease_timeout);
+        }
 
         // Recompute disk_object_count for restored metadata
         if (it->second.HasReplica([](const Replica& r) {
@@ -11796,7 +11935,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id, object_checksum?]
+    // replicas..., hard_pinned, group_id, object_checksum?, retired?]
 
     size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
@@ -11805,6 +11944,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     if (metadata.object_checksum.has_value()) {
         ++array_size;
     }
+    if (metadata.retired) ++array_size;
     packer.pack_array(array_size);
 
     // Serialize client_id
@@ -11852,6 +11992,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     if (metadata.object_checksum.has_value()) {
         packer.pack(*metadata.object_checksum);
     }
+    if (metadata.retired) packer.pack(true);
 
     return {};
 }
@@ -11926,7 +12067,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
     constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 4;
+    constexpr uint64_t kMaxOptionalFieldCount = 5;
     const uint64_t total_elements = obj.via.array.size;
     const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
@@ -11981,6 +12122,10 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         array[index].type == msgpack::type::POSITIVE_INTEGER) {
         object_checksum = array[index++].as<uint64_t>();
     }
+    bool retired = false;
+    if (index < total_elements && array[index].type == msgpack::type::BOOLEAN) {
+        retired = array[index++].as<bool>();
+    }
     if (index != total_elements) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
@@ -11995,6 +12140,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         size, std::move(replicas), std::nullopt, is_hard_pinned, data_type,
         group_id);
     metadata->object_checksum = object_checksum;
+    metadata->retired = retired;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
@@ -13076,6 +13222,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.retired = metadata.retired;
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -13102,6 +13249,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.retired = metadata.retired;
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -13126,6 +13274,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.retired = metadata.retired;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

@@ -340,6 +340,8 @@ class RealClient : public PyClient {
 
     long removeAll(bool force = false);
 
+    std::vector<int> batchRetire(const std::vector<std::string> &keys) override;
+
     std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                  bool force = false);
 
@@ -726,6 +728,9 @@ class RealClient : public PyClient {
                                                          bool force = false);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
+
+    std::vector<tl::expected<void, ErrorCode>> batchRetire_internal(
+        const std::vector<std::string> &keys);
 
     std::vector<tl::expected<void, ErrorCode>> batchRemove_internal(
         const std::vector<std::string> &keys, bool force = false);

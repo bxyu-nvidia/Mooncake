@@ -712,6 +712,12 @@ class MasterService {
      */
     size_t GetKeyCount() const;
 
+    // Stop issuing read leases; deletion follows asynchronously after existing
+    // leases and internal replica users drain. Success means accepted, not
+    // freed.
+    std::vector<tl::expected<void, ErrorCode>> BatchRetire(
+        const std::vector<std::string>& keys, const TenantId& tenant_id);
+
     /**
      * @brief Heartbeat from client
      * @param client_id The uuid of the client
@@ -1115,6 +1121,8 @@ class MasterService {
         // otherwise be distinguished from the current write.
         std::optional<PendingSoftPinAction> pending_soft_pin_action;
         const bool hard_pinned{false};  // immutable, set at creation
+        // Protected by the metadata shard lock, like replicas and write state.
+        bool retired{false};
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
         TenantQuotaLedger quota_ledger;
@@ -1324,6 +1332,7 @@ class MasterService {
         // Grant an ordinary read lease with timeout as now() + ttl. Soft-pin
         // lifetime is intentionally independent from reads.
         void GrantReadLease(const uint64_t ttl) const {
+            if (retired) return;
             SpinLocker locker(&lock);
             std::chrono::system_clock::time_point now =
                 std::chrono::system_clock::now();
@@ -1707,7 +1716,8 @@ class MasterService {
         void Remove(const std::string& scoped_key);
         void RemoveIfMatches(const std::string& scoped_key, size_t shard_idx,
                              const TimePoint& deadline);
-        std::vector<Entry> PopExpired(const TimePoint& now);
+        std::vector<Entry> PopExpired(const TimePoint& now,
+                                      size_t limit = SIZE_MAX);
         void Clear();
 
         size_t HeapSizeForTest() const;
@@ -1738,6 +1748,10 @@ class MasterService {
     };
 
     mutable SoftPinDeadlineIndex soft_pin_deadline_index_;
+    // Reuse the keyed deadline index: one registration per resident retired
+    // key.
+    SoftPinDeadlineIndex retirement_deadline_index_;
+    void CleanupRetiredObjects(std::chrono::system_clock::time_point now);
 
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);

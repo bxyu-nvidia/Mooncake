@@ -156,7 +156,7 @@ DeserializeStandbyObjectMetadata(
         // replica_count from wrapping the bounds and slipping an out-of-bounds
         // index through.
         constexpr uint64_t kBaseFieldCount = 7;
-        constexpr uint64_t kMaxOptionalFieldCount = 4;
+        constexpr uint64_t kMaxOptionalFieldCount = 5;
         const uint64_t total_elements = object.via.array.size;
         const uint64_t min_elements = kBaseFieldCount + replica_count;
         if (total_elements < min_elements ||
@@ -225,7 +225,20 @@ DeserializeStandbyObjectMetadata(
             group_id = array[index++].as<std::string>();
         }
 
+        // Checksum is optional and precedes the retirement flag.
+        if (index < total_elements &&
+            array[index].type == msgpack::type::POSITIVE_INTEGER)
+            ++index;
+        bool retired = false;
+        if (index < total_elements &&
+            array[index].type == msgpack::type::BOOLEAN) {
+            retired = array[index++].as<bool>();
+        }
+        if (index != total_elements) {
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
         StandbyObjectMetadata metadata;
+        metadata.retired = retired;
         metadata.client_id = client_id;
         metadata.size = size;
         metadata.replicas = std::move(replicas);

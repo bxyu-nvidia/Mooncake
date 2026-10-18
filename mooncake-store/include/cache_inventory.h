@@ -59,7 +59,8 @@ class CacheInventoryAccumulator {
     }
 
     // Visit each logical key exactly once, irrespective of replica count.
-    void Add(const std::string& key, uint64_t size, bool ready) {
+    void Add(const std::string& key, uint64_t size, bool ready,
+             bool retired = false) {
         auto split = key.rfind('@');
         if (split == std::string::npos || split + 1 == key.size()) return;
         auto it = namespaces_.find(key.substr(0, split));
@@ -81,6 +82,7 @@ class CacheInventoryAccumulator {
         counts_[metric + "_bytes"] += size;
         if (entry.kind == "mamba") {
             auto& prefix = mamba_[entry.scope][hash];
+            prefix.retired = prefix.retired || retired;
             if (ready) {
                 ++prefix.ready_objects;
                 prefix.ready_bytes += size;
