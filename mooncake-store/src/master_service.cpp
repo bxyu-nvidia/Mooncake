@@ -773,7 +773,7 @@ CacheInventorySnapshot MasterService::GetCacheInventory(
     const TenantId& tenant_id) const {
     CacheInventoryAccumulator inventory(namespaces);
     const auto started = std::chrono::steady_clock::now();
-    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // A read-only, approximate cross-shard snapshot. No leases or recency
     // touches.
     for (size_t i = 0; i < kNumShards; ++i) {
