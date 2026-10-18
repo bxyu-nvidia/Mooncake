@@ -1,8 +1,8 @@
 #pragma once
 
-#include <csignal>
-
 #include <atomic>
+#include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -76,6 +76,8 @@ class MasterAdminServer {
                       coro_http::coro_http_response& resp);
     void HandleQueryKey(coro_http::coro_http_request& req,
                         coro_http::coro_http_response& resp);
+    void HandleCacheInventory(coro_http::coro_http_request& req,
+                              coro_http::coro_http_response& resp);
     void HandleGetAllKeys(coro_http::coro_http_request& req,
                           coro_http::coro_http_response& resp);
     void HandleGetAllSegments(coro_http::coro_http_request& req,
@@ -116,6 +118,11 @@ class MasterAdminServer {
     std::atomic<bool> metric_report_running_{false};
     std::binary_semaphore metric_report_stop_sem_{0};
     std::atomic<bool> started_{false};
+    std::mutex cache_inventory_mutex_;
+    std::string cache_inventory_request_;
+    std::string cache_inventory_response_;
+    std::chrono::steady_clock::time_point cache_inventory_refresh_at_{};
+
     // Serializes storage projection with service-plane handoff so a refresh
     // that sampled the old leader cannot publish after it becomes unavailable.
     mutable std::mutex storage_metrics_refresh_mutex_;

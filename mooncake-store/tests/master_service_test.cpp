@@ -471,6 +471,46 @@ class MasterServiceTest : public ::testing::Test {
     }
 };
 
+TEST_F(MasterServiceTest, CacheInventoryCountsReadyPendingAndMissingShards) {
+    MasterService service;
+    PauseReplicaCleanup(service);
+    const auto context = PrepareSimpleSegment(service);
+    const ReplicateConfig config{.replica_num = 1};
+    const std::vector<CacheInventoryNamespace> layout{
+        {"model", "attn0", "attention"},
+        {"model", "attn1", "attention"},
+        {"model", "mamba0", "mamba"},
+        {"model", "mamba1", "mamba"}};
+    for (const auto* key :
+         {"attn0@hash", "attn1@hash", "mamba0@hash", "mamba1@hash",
+          "mamba0@partial", "unrelated@hash"}) {
+        PutCompletedObject(service, context.client_id, key, config, 1024);
+    }
+    ASSERT_TRUE(service
+                    .PutStart(context.client_id, "mamba1@partial",
+                              TenantId::Default(), 2048, config)
+                    .has_value());
+    const auto snapshot =
+        service.GetCacheInventory(layout, TenantId::Default());
+    EXPECT_EQ(snapshot.counts.at("attention.ready_objects"), 2);
+    EXPECT_EQ(snapshot.counts.at("attention.distinct_prefixes"), 1);
+    EXPECT_EQ(snapshot.counts.at("mamba.ready_objects"), 3);
+    EXPECT_EQ(snapshot.counts.at("mamba.ready_bytes"), 3072);
+    EXPECT_EQ(snapshot.counts.at("mamba.pending_objects"), 1);
+    EXPECT_EQ(snapshot.counts.at("mamba.pending_bytes"), 2048);
+    EXPECT_EQ(snapshot.counts.at("mamba.complete_prefixes"), 1);
+    EXPECT_EQ(snapshot.counts.at("mamba.incomplete_prefixes"), 1);
+    EXPECT_GT(snapshot.snapshot_timestamp_seconds, 0);
+    EXPECT_GE(snapshot.scan_seconds, 0);
+    // Expected shards remain required even when none of their keys survive.
+    auto expanded = layout;
+    expanded.push_back({"model", "mamba2", "mamba"});
+    const auto missing =
+        service.GetCacheInventory(expanded, TenantId::Default());
+    EXPECT_EQ(missing.counts.at("mamba.complete_prefixes"), 0);
+    EXPECT_EQ(missing.counts.at("mamba.incomplete_prefixes"), 2);
+}
+
 TEST_F(MasterServiceTest, ObjectChecksumIsStoredAndClearedByUpsert) {
     MasterService service;
     const auto segment = PrepareSimpleSegment(service, "checksum_segment");

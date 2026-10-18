@@ -188,6 +188,9 @@ class WrappedMasterService {
     tl::expected<std::string, ErrorCode> ServiceReady();
 
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+    [[nodiscard]] CacheInventorySnapshot GetCacheInventory(
+        const std::vector<CacheInventoryNamespace>& namespaces,
+        const std::string& tenant_id) const;
 
     tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
     ListTenantQuotaSnapshots();

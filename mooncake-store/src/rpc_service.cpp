@@ -1462,6 +1462,14 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+CacheInventorySnapshot WrappedMasterService::GetCacheInventory(
+    const std::vector<CacheInventoryNamespace>& namespaces,
+    const std::string& tenant_id) const {
+    const TenantId tenant(tenant_id);
+    if (!tenant.IsValid()) throw std::invalid_argument("Invalid tenant_id");
+    return master_service_.GetCacheInventory(namespaces, tenant);
+}
+
 TieredStorageUsageSnapshot WrappedMasterService::GetStorageUsageSnapshot()
     const {
     return master_service_.GetStorageUsageSnapshot();

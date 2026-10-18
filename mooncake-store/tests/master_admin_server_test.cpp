@@ -81,6 +81,14 @@ struct HttpErrorResponse {
 };
 YLT_REFL(HttpErrorResponse, success, error_code, error_message);
 
+struct HttpCacheInventoryResponse {
+    std::map<std::string, uint64_t> counts;
+    double snapshot_timestamp_seconds{0};
+    double scan_seconds{0};
+};
+YLT_REFL(HttpCacheInventoryResponse, counts, snapshot_timestamp_seconds,
+         scan_seconds);
+
 struct HttpSegmentsDetailResponse {
     uint64_t total_segments{0};
 };
@@ -739,6 +747,33 @@ Segment MasterAdminServerWithServiceTest::segment_;
 // -----------------------------------------------------------------------
 // GET /get_all_keys
 // -----------------------------------------------------------------------
+
+TEST_F(MasterAdminServerWithServiceTest,
+       CacheInventoryIsValidatedAndRateLimited) {
+    EXPECT_EQ(
+        HttpPostJson("/cache_inventory", R"({"namespaces":[]})").http_status,
+        400);
+    const std::string body =
+        R"({"tenant_id":"default","namespaces":[{"scope":"model","prefix":"inventory_absent","kind":"mamba"}]})";
+    const auto first = HttpPostJson("/cache_inventory", body);
+    ASSERT_EQ(first.http_status, 200);
+    HttpCacheInventoryResponse snapshot;
+    struct_json::from_json(snapshot, first.body);
+    EXPECT_EQ(snapshot.counts.at("mamba.ready_objects"), 0);
+    EXPECT_EQ(snapshot.counts.at("mamba.complete_prefixes"), 0);
+    EXPECT_GT(snapshot.snapshot_timestamp_seconds, 0);
+    EXPECT_GE(snapshot.scan_seconds, 0);
+    const auto cached = HttpPostJson("/cache_inventory", body);
+    EXPECT_EQ(cached.http_status, 200);
+    EXPECT_EQ(cached.body, first.body);
+    const auto different = HttpPostJson(
+        "/cache_inventory",
+        R"({"namespaces":[{"scope":"model","prefix":"other_absent","kind":"mamba"}]})");
+    EXPECT_EQ(different.http_status, 503);
+    admin_->SetServiceAvailable(false);
+    EXPECT_EQ(HttpPostJson("/cache_inventory", body).http_status, 503);
+    admin_->SetServiceAvailable(true);
+}
 
 TEST_F(MasterAdminServerWithServiceTest, GetAllKeysReturnsKeys) {
     auto resp = HttpGet("/get_all_keys");

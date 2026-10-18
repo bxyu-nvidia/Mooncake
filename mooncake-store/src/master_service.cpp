@@ -768,6 +768,36 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
     return it->second.consecutive_failures;
 }
 
+CacheInventorySnapshot MasterService::GetCacheInventory(
+    const std::vector<CacheInventoryNamespace>& namespaces,
+    const TenantId& tenant_id) const {
+    CacheInventoryAccumulator inventory(namespaces);
+    const auto started = std::chrono::steady_clock::now();
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    // A read-only, approximate cross-shard snapshot. No leases or recency
+    // touches.
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRO shard(this, i);
+        auto tenant = shard->tenants.find(tenant_id);
+        if (tenant == shard->tenants.end()) continue;
+        for (const auto& [key, metadata] : tenant->second.metadata) {
+            bool ready = false;
+            metadata.VisitReplicas(&Replica::fn_is_completed,
+                                   [&](const Replica&) { ready = true; });
+            inventory.Add(key, metadata.size, ready);
+        }
+    }
+    auto result = inventory.Finish();
+    result.snapshot_timestamp_seconds =
+        std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    result.scan_seconds = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - started)
+                              .count();
+    return result;
+}
+
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
     return {
         .memory = segment_manager_.GetMemoryUsageSnapshot(),

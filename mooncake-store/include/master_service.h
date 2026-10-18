@@ -43,6 +43,7 @@
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
+#include "cache_inventory.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
@@ -183,6 +184,9 @@ class MasterService {
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+    [[nodiscard]] CacheInventorySnapshot GetCacheInventory(
+        const std::vector<CacheInventoryNamespace>& namespaces,
+        const TenantId& tenant_id) const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(

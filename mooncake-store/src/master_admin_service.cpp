@@ -23,6 +23,8 @@
 #include "types.h"
 
 namespace mooncake {
+YLT_REFL(CacheInventoryNamespace, scope, prefix, kind);
+YLT_REFL(CacheInventorySnapshot, counts, snapshot_timestamp_seconds, scan_seconds);
 
 const uint64_t kMetricReportIntervalSeconds = 10;
 
@@ -35,6 +37,12 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
     primary += secondary;
     return primary;
 }
+
+struct HttpCacheInventoryRequest {
+    std::string tenant_id{"default"};
+    std::vector<CacheInventoryNamespace> namespaces;
+};
+YLT_REFL(HttpCacheInventoryRequest, tenant_id, namespaces);
 
 struct HttpErrorResponse {
     bool success{false};
@@ -641,6 +649,60 @@ void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
     });
 }
 
+void MasterAdminServer::HandleCacheInventory(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        if (req.get_body().size() > 1024 * 1024) {
+            WriteSimpleErrorResponse(resp, coro_http::status_type::bad_request,
+                                     "Inventory request exceeds 1 MiB");
+            return;
+        }
+        HttpCacheInventoryRequest request;
+        try {
+            struct_json::from_json(request, req.get_body());
+            // Validate even on a cache hit.
+            CacheInventoryAccumulator validate(request.namespaces);
+            std::unique_lock<std::mutex> lock(cache_inventory_mutex_,
+                                              std::try_to_lock);
+            if (!lock.owns_lock()) {
+                WriteSimpleErrorResponse(
+                    resp, coro_http::status_type::service_unavailable,
+                    "Cache inventory scan already in progress");
+                return;
+            }
+            std::string body(req.get_body());
+            if (body != cache_inventory_request_ &&
+                std::chrono::steady_clock::now() <
+                    cache_inventory_refresh_at_) {
+                WriteSimpleErrorResponse(
+                    resp, coro_http::status_type::service_unavailable,
+                    "Cache inventory scan rate limited; retry after 10 "
+                    "seconds");
+                return;
+            }
+            if (body != cache_inventory_request_ ||
+                std::chrono::steady_clock::now() >=
+                    cache_inventory_refresh_at_) {
+                const auto scan_started = std::chrono::steady_clock::now();
+                const auto snapshot = service->GetCacheInventory(
+                    request.namespaces, request.tenant_id);
+                std::string json;
+                struct_json::to_json(snapshot, json);
+                cache_inventory_request_ = std::move(body);
+                cache_inventory_response_ = std::move(json);
+                cache_inventory_refresh_at_ =
+                    scan_started + std::chrono::seconds(10);
+            }
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+            resp.set_status_and_content(coro_http::status_type::ok,
+                                        cache_inventory_response_);
+        } catch (const std::exception&) {
+            WriteSimpleErrorResponse(resp, coro_http::status_type::bad_request,
+                                     "Invalid cache inventory request");
+        }
+    });
+}
+
 void MasterAdminServer::HandleGetAllKeys(coro_http::coro_http_request&,
                                          coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
@@ -1238,6 +1300,11 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/query_key", [this](coro_http_request& req, coro_http_response& resp) {
             HandleQueryKey(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/cache_inventory",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleCacheInventory(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/get_all_keys",
