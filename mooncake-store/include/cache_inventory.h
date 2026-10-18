@@ -36,6 +36,7 @@ class CacheInventoryAccumulator {
             if (entry.prefix.empty() || entry.prefix.size() > 4096 ||
                 entry.scope.empty() || entry.scope.size() > 4096 ||
                 (entry.kind != "attention" && entry.kind != "mamba" &&
+                 entry.kind != "mamba_anchor" &&
                  entry.kind != "mamba_lineage" &&
                  entry.kind != "mamba_retired") ||
                 !namespaces_.emplace(entry.prefix, entry).second)
@@ -44,7 +45,8 @@ class CacheInventoryAccumulator {
             if (entry.kind == "mamba") ++expected_mamba_[entry.scope];
         }
         for (const auto& entry : namespaces) {
-            if ((entry.kind == "mamba_lineage" ||
+            if ((entry.kind == "mamba_anchor" ||
+                 entry.kind == "mamba_lineage" ||
                  entry.kind == "mamba_retired") &&
                 expected_mamba_.count(entry.scope) == 0)
                 throw std::invalid_argument(
@@ -59,19 +61,21 @@ class CacheInventoryAccumulator {
     }
 
     // Visit each logical key exactly once, irrespective of replica count.
-    void Add(const std::string& key, uint64_t size, bool ready,
-             bool retired = false) {
+    void Add(const std::string& key, uint64_t size, bool ready) {
         auto split = key.rfind('@');
         if (split == std::string::npos || split + 1 == key.size()) return;
         auto it = namespaces_.find(key.substr(0, split));
         if (it == namespaces_.end()) return;
         const auto& entry = it->second;
         const auto hash = key.substr(split + 1);
-        if (entry.kind == "mamba_lineage" || entry.kind == "mamba_retired") {
+        if (entry.kind == "mamba_anchor" || entry.kind == "mamba_lineage" ||
+            entry.kind == "mamba_retired") {
             if (ready) {
                 auto& prefix = mamba_[entry.scope][hash];
                 if (entry.kind == "mamba_retired")
                     prefix.retired = true;
+                else if (entry.kind == "mamba_anchor")
+                    prefix.anchor = true;
                 else
                     prefix.lineage = true;
             }
@@ -82,7 +86,6 @@ class CacheInventoryAccumulator {
         counts_[metric + "_bytes"] += size;
         if (entry.kind == "mamba") {
             auto& prefix = mamba_[entry.scope][hash];
-            prefix.retired = prefix.retired || retired;
             if (ready) {
                 ++prefix.ready_objects;
                 prefix.ready_bytes += size;
@@ -106,7 +109,7 @@ class CacheInventoryAccumulator {
             uint64_t incomplete{0};
             MambaPrefix payload{};
         };
-        Category categories[]{{"anchor_or_unknown"}, {"tip"}, {"retired"}};
+        Category categories[]{{"unknown"}, {"tip"}, {"retired"}, {"anchor"}};
         for (const auto& [scope, hashes] : mamba_) {
             for (const auto& [hash, prefix] : hashes) {
                 // Markers can outlive their payloads. They are not checkpoints.
@@ -118,11 +121,11 @@ class CacheInventoryAccumulator {
                     ++complete;
                 else
                     ++incomplete;
-                // Absence of lineage is ambiguous: genuine root, lost marker,
-                // untracked save, or retirement disabled. Never call it a known
-                // root.
+                // Only an explicit marker is evidence of an anchor. Derived
+                // or retired evidence takes precedence if markers coexist.
                 auto& category = prefix.retired   ? categories[2]
                                  : prefix.lineage ? categories[1]
+                                 : prefix.anchor  ? categories[3]
                                                   : categories[0];
                 if (is_complete)
                     ++category.complete;
@@ -148,6 +151,14 @@ class CacheInventoryAccumulator {
             result.counts[metric + "pending_bytes"] =
                 category.payload.pending_bytes;
         }
+        // Preserve existing dashboards as an aggregate, not a fifth category.
+        for (const auto* measure :
+             {"complete_prefixes", "incomplete_prefixes", "ready_objects",
+              "ready_bytes", "pending_objects", "pending_bytes"}) {
+            result.counts[std::string("mamba.anchor_or_unknown.") + measure] =
+                result.counts[std::string("mamba.anchor.") + measure] +
+                result.counts[std::string("mamba.unknown.") + measure];
+        }
         auto& attention = result.counts["attention.distinct_prefixes"];
         for (const auto& [scope, hashes] : attention_)
             attention += hashes.size();
@@ -162,6 +173,7 @@ class CacheInventoryAccumulator {
         uint64_t ready_bytes{0};
         uint64_t pending_objects{0};
         uint64_t pending_bytes{0};
+        bool anchor{false};
         bool lineage{false};
         bool retired{false};
     };

@@ -395,9 +395,6 @@ class PyClient {
 
     virtual long removeAll(bool force = false) = 0;
 
-    virtual std::vector<int> batchRetire(
-        const std::vector<std::string> &keys) = 0;
-
     virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                          bool force = false) = 0;
 

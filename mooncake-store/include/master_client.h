@@ -307,11 +307,6 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
-    // Stop new reads; reclaim after existing leases and internal users drain.
-    // Success acknowledges retirement, not completed deletion.
-    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRetire(
-        const std::vector<std::string>& keys);
-
     /**
      * @brief Batch remove objects and all their replicas
      * @param keys List of keys to remove

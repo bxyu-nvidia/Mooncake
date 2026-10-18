@@ -138,11 +138,6 @@ struct RpcNameTraits<&WrappedMasterService::RemoveAll> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchRetire> {
-    static constexpr const char* value = "BatchRetire";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::BatchRemove> {
     static constexpr const char* value = "BatchRemove";
 };
@@ -789,12 +784,6 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
         force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRetire(
-    const std::vector<std::string>& keys) {
-    return invoke_batch_rpc<&WrappedMasterService::BatchRetire, void>(
-        keys.size(), keys, tenant_id_.value());
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(

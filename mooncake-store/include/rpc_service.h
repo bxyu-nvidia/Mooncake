@@ -147,10 +147,6 @@ class WrappedMasterService {
     long RemoveAll(bool force = false,
                    const std::string& tenant_id = "default");
 
-    std::vector<tl::expected<void, ErrorCode>> BatchRetire(
-        const std::vector<std::string>& keys,
-        const std::string& tenant_id = "default");
-
     std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false,
         const std::string& tenant_id = "default");

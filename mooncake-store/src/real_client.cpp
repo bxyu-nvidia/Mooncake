@@ -2255,23 +2255,6 @@ long RealClient::removeAll(bool force) {
     return to_py_ret(removeAll_internal(force));
 }
 
-std::vector<tl::expected<void, ErrorCode>> RealClient::batchRetire_internal(
-    const std::vector<std::string> &keys) {
-    if (!client_) {
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    return client_->BatchRetire(keys);
-}
-
-std::vector<int> RealClient::batchRetire(const std::vector<std::string> &keys) {
-    auto internal = batchRetire_internal(keys);
-    std::vector<int> results;
-    results.reserve(internal.size());
-    for (const auto &result : internal) results.push_back(to_py_ret(result));
-    return results;
-}
-
 std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
     const std::vector<std::string> &keys, bool force) {
     if (!client_) {

@@ -102,13 +102,48 @@ TEST(CacheInventoryTest, OldLayoutsStillWorkAndEmptyCategoriesExportZero) {
     EXPECT_EQ(counts.at("mamba.retired.ready_bytes"), 0U);
 }
 
-TEST(CacheInventoryTest, MasterRetirementSurvivesMissingMarkerObjects) {
-    CacheInventoryAccumulator inventory({{"model", "m", "mamba"}});
-    inventory.Add("m@hash", 1024, true, true);
+TEST(CacheInventoryTest, ExplicitAnchorEvidenceAndUnknownRemainDistinct) {
+    auto namespaces = layout;
+    namespaces.push_back({"model", "anchor", "mamba_anchor"});
+    CacheInventoryAccumulator inventory(namespaces);
+    for (const auto* hash : {"root", "unknown", "derived", "retired"}) {
+        inventory.Add(std::string("m0@") + hash, 100, true);
+        inventory.Add(std::string("m1@") + hash, 200, true);
+    }
+    inventory.Add("anchor@root", 1, true);
+    inventory.Add("anchor@unknown", 1, false);  // Not yet published.
+    inventory.Add("anchor@orphan", 1, true);    // No payload.
+    inventory.Add("anchor@derived", 1, true);
+    inventory.Add("lineage@derived", 1, true);
+    inventory.Add("anchor@retired", 1, true);
+    inventory.Add("retired@retired", 1, true);
     const auto counts = inventory.Finish().counts;
-    EXPECT_EQ(counts.at("mamba.retired.complete_prefixes"), 1U);
-    EXPECT_EQ(counts.at("mamba.retired.ready_bytes"), 1024U);
-    EXPECT_EQ(counts.at("mamba.anchor_or_unknown.complete_prefixes"), 0U);
+    for (const auto* category : {"anchor", "unknown", "tip", "retired"}) {
+        EXPECT_EQ(
+            counts.at(std::string("mamba.") + category + ".complete_prefixes"),
+            1U);
+        EXPECT_EQ(counts.at(std::string("mamba.") + category + ".ready_bytes"),
+                  300U);
+    }
+    EXPECT_EQ(counts.at("mamba.anchor_or_unknown.complete_prefixes"), 2U);
+    EXPECT_EQ(counts.at("mamba.anchor_or_unknown.ready_bytes"), 600U);
+}
+
+TEST(CacheInventoryTest, EvictedAnchorMarkerBecomesUnknown) {
+    auto namespaces = layout;
+    namespaces.push_back({"model", "anchor", "mamba_anchor"});
+    CacheInventoryAccumulator before(namespaces);
+    before.Add("m0@root", 100, true);
+    before.Add("m1@root", 200, true);
+    before.Add("anchor@root", 1, true);
+    EXPECT_EQ(before.Finish().counts.at("mamba.anchor.complete_prefixes"), 1U);
+    CacheInventoryAccumulator inventory(namespaces);
+    inventory.Add("m0@root", 100, true);
+    inventory.Add("m1@root", 200, true);
+    const auto counts = inventory.Finish().counts;
+    EXPECT_EQ(counts.at("mamba.anchor.complete_prefixes"), 0U);
+    EXPECT_EQ(counts.at("mamba.unknown.complete_prefixes"), 1U);
+    EXPECT_EQ(counts.at("mamba.unknown.ready_bytes"), 300U);
 }
 
 TEST(CacheInventoryTest, MarkerNamespaceRequiresMatchingPayloadScope) {
