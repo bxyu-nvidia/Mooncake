@@ -138,6 +138,11 @@ struct RpcNameTraits<&WrappedMasterService::RemoveAll> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchCheckpointMetadata> {
+    static constexpr const char* value = "BatchCheckpointMetadata";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchRemove> {
     static constexpr const char* value = "BatchRemove";
 };
@@ -784,6 +789,13 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
         force, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
+}
+
+std::vector<tl::expected<int, ErrorCode>> MasterClient::BatchCheckpointMetadata(
+    const std::vector<std::string>& keys, int add_flags) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchCheckpointMetadata,
+                            int>(keys.size(), keys, add_flags,
+                                 tenant_id_.value());
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(

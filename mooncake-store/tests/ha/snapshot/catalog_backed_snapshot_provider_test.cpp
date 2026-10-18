@@ -71,7 +71,8 @@ class CatalogBackedSnapshotProviderTest
 
     // Loads the published snapshot and asserts the single default object
     // round-trips intact, regardless of the metadata on-wire format.
-    void ExpectLoadsDefaultObject(bool expected_hard_pinned = false) {
+    void ExpectLoadsDefaultObject(bool expected_hard_pinned = false,
+                                  uint8_t expected_checkpoint_flags = 0) {
         auto provider = CreateProvider();
         ASSERT_TRUE(provider.has_value()) << toString(provider.error());
 
@@ -87,6 +88,8 @@ class CatalogBackedSnapshotProviderTest
         EXPECT_EQ(metadata.client_id, (UUID{1, 2}));
         EXPECT_EQ(metadata.size, kDefaultTestObjectSize);
         EXPECT_EQ(metadata.hard_pinned.value_or(false), expected_hard_pinned);
+        EXPECT_EQ(metadata.checkpoint_flags.value_or(0),
+                  expected_checkpoint_flags);
         ASSERT_EQ(metadata.replicas.size(), 1u);
 
         const auto& replica = metadata.replicas.front();
@@ -201,6 +204,19 @@ TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotIgnoresObjectChecksum) {
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithObjectChecksum);
     ExpectLoadsDefaultObject(true);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotWithCheckpointFlags) {
+    PublishSnapshotPayload(SnapshotMetadataFormat::kWithCheckpointFlags);
+    ExpectLoadsDefaultObject(true, 7);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotWithChecksumAndCheckpointFlags) {
+    PublishSnapshotPayload(
+        SnapshotMetadataFormat::kWithChecksumAndCheckpointFlags);
+    ExpectLoadsDefaultObject(true, 7);
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest,

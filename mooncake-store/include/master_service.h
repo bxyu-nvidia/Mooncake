@@ -712,6 +712,13 @@ class MasterService {
      */
     size_t GetKeyCount() const;
 
+    // Read checkpoint provenance, or monotonically add flags to resident
+    // completed objects. Never grants leases, hides keys, or deletes payloads.
+    // Returns flags | READY per key, or an ordinary Store error.
+    std::vector<tl::expected<int, ErrorCode>> BatchCheckpointMetadata(
+        const std::vector<std::string>& keys, int add_flags,
+        const TenantId& tenant_id);
+
     /**
      * @brief Heartbeat from client
      * @param client_id The uuid of the client
@@ -1115,6 +1122,7 @@ class MasterService {
         // otherwise be distinguished from the current write.
         std::optional<PendingSoftPinAction> pending_soft_pin_action;
         const bool hard_pinned{false};  // immutable, set at creation
+        uint8_t checkpoint_flags{0};    // Protected by the metadata shard lock.
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
         TenantQuotaLedger quota_ledger;

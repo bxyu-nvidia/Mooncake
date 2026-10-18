@@ -893,6 +893,19 @@ long WrappedMasterService::RemoveAll(bool force, const std::string& tenant_id) {
     return result;
 }
 
+std::vector<tl::expected<int, ErrorCode>>
+WrappedMasterService::BatchCheckpointMetadata(
+    const std::vector<std::string>& keys, int add_flags,
+    const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& tenant) {
+            return master_service_.BatchCheckpointMetadata(keys, add_flags,
+                                                           tenant);
+        });
+}
+
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchRemove(
     const std::vector<std::string>& keys, bool force,
     const std::string& tenant_id) {
@@ -1783,6 +1796,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchCheckpointMetadata>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchRemove>(
         &wrapped_master_service);

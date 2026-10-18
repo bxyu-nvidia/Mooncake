@@ -3373,6 +3373,11 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return result;
 }
 
+std::vector<tl::expected<int, ErrorCode>> Client::BatchCheckpointMetadata(
+    const std::vector<ObjectKey>& keys, int add_flags) {
+    return master_client_.BatchCheckpointMetadata(keys, add_flags);
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
     if (hot_cache_) {

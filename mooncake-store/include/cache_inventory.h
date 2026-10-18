@@ -12,6 +12,13 @@
 
 namespace mooncake {
 
+// Object-resident checkpoint provenance. READY is a response bit, not stored.
+inline constexpr uint8_t kCheckpointAnchor = 1;
+inline constexpr uint8_t kCheckpointLineage = 2;
+inline constexpr uint8_t kCheckpointRetired = 4;
+inline constexpr uint8_t kCheckpointMetadataMask = 7;
+inline constexpr uint8_t kCheckpointReady = 8;
+
 // Explicit expected namespaces, supplied by the consumer's actual cache layout.
 // Missing shards must not be inferred away from the set of currently live keys.
 struct CacheInventoryNamespace {
@@ -61,7 +68,8 @@ class CacheInventoryAccumulator {
     }
 
     // Visit each logical key exactly once, irrespective of replica count.
-    void Add(const std::string& key, uint64_t size, bool ready) {
+    void Add(const std::string& key, uint64_t size, bool ready,
+             uint8_t checkpoint_flags = 0) {
         auto split = key.rfind('@');
         if (split == std::string::npos || split + 1 == key.size()) return;
         auto it = namespaces_.find(key.substr(0, split));
@@ -86,6 +94,9 @@ class CacheInventoryAccumulator {
         counts_[metric + "_bytes"] += size;
         if (entry.kind == "mamba") {
             auto& prefix = mamba_[entry.scope][hash];
+            prefix.anchor |= (checkpoint_flags & kCheckpointAnchor) != 0;
+            prefix.lineage |= (checkpoint_flags & kCheckpointLineage) != 0;
+            prefix.retired |= (checkpoint_flags & kCheckpointRetired) != 0;
             if (ready) {
                 ++prefix.ready_objects;
                 prefix.ready_bytes += size;

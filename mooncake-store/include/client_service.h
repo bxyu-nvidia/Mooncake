@@ -322,6 +322,10 @@ class Client {
      */
     tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
+    // Non-leasing metadata query/update. Returns provenance flags | READY.
+    std::vector<tl::expected<int, ErrorCode>> BatchCheckpointMetadata(
+        const std::vector<ObjectKey>& keys, int add_flags = 0);
+
     /**
      * @brief Batch remove objects and all their replicas
      * @param keys List of keys to remove

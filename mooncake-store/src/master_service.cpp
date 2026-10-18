@@ -784,7 +784,7 @@ CacheInventorySnapshot MasterService::GetCacheInventory(
             bool ready = false;
             metadata.VisitReplicas(&Replica::fn_is_completed,
                                    [&](const Replica&) { ready = true; });
-            inventory.Add(key, metadata.size, ready);
+            inventory.Add(key, metadata.size, ready, metadata.checkpoint_flags);
         }
     }
     auto result = inventory.Finish();
@@ -3273,6 +3273,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     standby_meta.hard_pinned.value_or(false),
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
+            tenant_state.metadata.at(object.user_key).checkpoint_flags =
+                standby_meta.checkpoint_flags.value_or(0);
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, object.tenant_id,
                                     object.user_key, standby_meta.group_id);
@@ -6792,6 +6794,64 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             << ", total_freed_size=" << total_freed_size
             << ", signaled_clients=" << clients_with_disk_replicas.size();
     return removed_count;
+}
+
+std::vector<tl::expected<int, ErrorCode>>
+MasterService::BatchCheckpointMetadata(const std::vector<std::string>& keys,
+                                       int add_flags,
+                                       const TenantId& tenant_id) {
+    if (add_flags < 0 || (add_flags & ~kCheckpointMetadataMask) != 0) {
+        return std::vector<tl::expected<int, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    const auto& tenant = ResolveRequestTenantId(tenant_id);
+    std::vector<tl::expected<int, ErrorCode>> results;
+    results.reserve(keys.size());
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    for (const auto& key : keys) {
+        const auto identity = MakeObjectIdentity(key, tenant);
+        if (add_flags == 0) {
+            MetadataAccessorRO accessor(this, identity);
+            if (!accessor.Exists()) {
+                results.emplace_back(
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+                continue;
+            }
+            const auto& metadata = accessor.Get();
+            results.emplace_back(
+                metadata.checkpoint_flags |
+                (HasReadableReplica(metadata) ? kCheckpointReady : 0));
+            continue;
+        }
+        MetadataAccessorRW accessor(this, identity);
+        if (!accessor.Exists()) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+            continue;
+        }
+        auto& metadata = accessor.Get();
+        if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY));
+            continue;
+        }
+        const auto previous = metadata.checkpoint_flags;
+        metadata.checkpoint_flags |= static_cast<uint8_t>(add_flags);
+        if (metadata.checkpoint_flags != previous && enable_oplog_) {
+            auto persisted = AppendOpLogVisibleBeforeDurable(
+                OpType::PUT_END, tenant.value(), key,
+                SerializeMetadataForOpLog(metadata));
+            if (!persisted) {
+                metadata.checkpoint_flags = previous;
+                results.emplace_back(tl::make_unexpected(persisted.error()));
+                continue;
+            }
+        }
+        results.emplace_back(
+            metadata.checkpoint_flags |
+            (HasReadableReplica(metadata) ? kCheckpointReady : 0));
+    }
+    return results;
 }
 
 auto MasterService::BatchRemove(const std::vector<std::string>& keys,
@@ -11777,6 +11837,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.object_checksum = metadata_ptr->object_checksum;
+        it->second.checkpoint_flags = metadata_ptr->checkpoint_flags;
 
         // Recompute disk_object_count for restored metadata
         if (it->second.HasReplica([](const Replica& r) {
@@ -11796,13 +11857,17 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id, object_checksum?]
+    // replicas..., hard_pinned, group_id, object_checksum?,
+    // [checkpoint_flags]?]
 
     size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned, group_id
     array_size += metadata.CountReplicas();  // One element per replica
     if (metadata.object_checksum.has_value()) {
+        ++array_size;
+    }
+    if (metadata.checkpoint_flags != 0) {
         ++array_size;
     }
     packer.pack_array(array_size);
@@ -11851,6 +11916,11 @@ MasterService::MetadataSerializer::SerializeMetadata(
     packer.pack(metadata.group_id);
     if (metadata.object_checksum.has_value()) {
         packer.pack(*metadata.object_checksum);
+    }
+    if (metadata.checkpoint_flags != 0) {
+        // An array distinguishes flags from an optional integer checksum.
+        packer.pack_array(1);
+        packer.pack(metadata.checkpoint_flags);
     }
 
     return {};
@@ -11922,11 +11992,12 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
     //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
     //   v5: 11 + replicas_count, v4 + object_checksum
+    //   v6: v4 or v5 + [checkpoint_flags]
     // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
     constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 4;
+    constexpr uint64_t kMaxOptionalFieldCount = 5;
     const uint64_t total_elements = obj.via.array.size;
     const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
@@ -11981,7 +12052,13 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         array[index].type == msgpack::type::POSITIVE_INTEGER) {
         object_checksum = array[index++].as<uint64_t>();
     }
-    if (index != total_elements) {
+    uint8_t checkpoint_flags = 0;
+    if (index < total_elements && array[index].type == msgpack::type::ARRAY &&
+        array[index].via.array.size == 1) {
+        checkpoint_flags = array[index++].via.array.ptr[0].as<uint8_t>();
+    }
+    if (index != total_elements ||
+        (checkpoint_flags & ~kCheckpointMetadataMask) != 0) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata optional field type mismatch"));
@@ -11995,6 +12072,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         size, std::move(replicas), std::nullopt, is_hard_pinned, data_type,
         group_id);
     metadata->object_checksum = object_checksum;
+    metadata->checkpoint_flags = checkpoint_flags;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
@@ -13076,6 +13154,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.checkpoint_flags = metadata.checkpoint_flags;
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -13102,6 +13181,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.checkpoint_flags = metadata.checkpoint_flags;
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -13126,6 +13206,7 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
     payload.hard_pinned = metadata.IsHardPinned();
+    payload.checkpoint_flags = metadata.checkpoint_flags;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

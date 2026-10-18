@@ -395,6 +395,9 @@ class PyClient {
 
     virtual long removeAll(bool force = false) = 0;
 
+    virtual std::vector<int> batchCheckpointMetadata(
+        const std::vector<std::string> &keys, int add_flags = 0) = 0;
+
     virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                          bool force = false) = 0;
 

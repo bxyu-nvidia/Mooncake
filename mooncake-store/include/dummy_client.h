@@ -164,6 +164,9 @@ class DummyClient : public PyClient {
 
     long removeAll(bool force = false);
 
+    std::vector<int> batchCheckpointMetadata(
+        const std::vector<std::string> &keys, int add_flags = 0) override;
+
     std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                  bool force = false);
 

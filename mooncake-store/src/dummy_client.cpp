@@ -885,6 +885,17 @@ long DummyClient::removeAll(bool force) {
         invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
 }
 
+std::vector<int> DummyClient::batchCheckpointMetadata(
+    const std::vector<std::string>& keys, int add_flags) {
+    auto internal =
+        invoke_batch_rpc<&RealClient::batchCheckpointMetadata_internal, int>(
+            keys.size(), keys, add_flags);
+    std::vector<int> results;
+    results.reserve(internal.size());
+    for (const auto& result : internal) results.push_back(to_py_ret(result));
+    return results;
+}
+
 std::vector<int> DummyClient::batchRemove(const std::vector<std::string>& keys,
                                           bool force) {
     auto internal_results =

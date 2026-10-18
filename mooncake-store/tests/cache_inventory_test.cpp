@@ -152,4 +152,36 @@ TEST(CacheInventoryTest, MarkerNamespaceRequiresMatchingPayloadScope) {
     EXPECT_THROW(CacheInventoryAccumulator{invalid}, std::invalid_argument);
 }
 }  // namespace
+TEST(CacheInventoryPayloadMetadataTest, LabelsSurviveWithoutStandaloneMarkers) {
+    CacheInventoryAccumulator inventory(layout);
+    for (const auto* prefix : {"m0", "m1"}) {
+        inventory.Add(std::string(prefix) + "@anchor", 100, true,
+                      kCheckpointAnchor);
+        inventory.Add(std::string(prefix) + "@tip", 100, true,
+                      kCheckpointLineage);
+        inventory.Add(std::string(prefix) + "@retired", 100, true,
+                      kCheckpointLineage | kCheckpointRetired);
+        inventory.Add(std::string(prefix) + "@unknown", 100, true);
+    }
+    const auto counts = inventory.Finish().counts;
+    for (const auto* category : {"anchor", "tip", "retired", "unknown"}) {
+        EXPECT_EQ(
+            counts.at(std::string("mamba.") + category + ".complete_prefixes"),
+            1U);
+        EXPECT_EQ(counts.at(std::string("mamba.") + category + ".ready_bytes"),
+                  200U);
+    }
+}
+
+TEST(CacheInventoryPayloadMetadataTest,
+     SurvivingShardRetainsRetirementEvidence) {
+    CacheInventoryAccumulator inventory(layout);
+    inventory.Add("m0@partial", 100, true,
+                  kCheckpointAnchor | kCheckpointLineage | kCheckpointRetired);
+    const auto counts = inventory.Finish().counts;
+    EXPECT_EQ(counts.at("mamba.retired.incomplete_prefixes"), 1U);
+    EXPECT_EQ(counts.at("mamba.retired.ready_bytes"), 100U);
+    EXPECT_EQ(counts.at("mamba.unknown.ready_bytes"), 0U);
+}
+
 }  // namespace mooncake

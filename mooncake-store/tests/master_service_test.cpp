@@ -92,6 +92,27 @@ class MasterServiceTest : public ::testing::Test {
         service.replica_cleanup_worker_.Stop();
     }
 
+    std::chrono::system_clock::time_point CheckpointLease(
+        MasterService& service, const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, service.MakeObjectIdentity(key, TenantId::Default()));
+        const auto& metadata = accessor.Get();
+        SpinLocker locker(&metadata.lock);
+        return metadata.lease_timeout;
+    }
+
+    void CheckCheckpointOpLogRoundTrip(MasterService& service,
+                                       const std::string& key, uint8_t flags) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, service.MakeObjectIdentity(key, TenantId::Default()));
+        auto bytes = service.SerializeMetadataForOpLog(accessor.Get());
+        auto decoded = struct_pack::deserialize<MetadataPayload>(bytes);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->checkpoint_flags.value_or(0), flags);
+        EXPECT_EQ(decoded->ToStandbyMetadata().checkpoint_flags.value_or(0),
+                  flags);
+    }
+
     void ResumeReplicaCleanup(MasterService& service) {
         service.replica_cleanup_worker_.Start();
         service.replica_cleanup_worker_.Schedule();
@@ -5821,6 +5842,83 @@ TEST_F(MasterServiceTest, BatchExistKeyGroupedAndIncompletePreservesOrder) {
     EXPECT_FALSE(resp[2].value());
     EXPECT_FALSE(resp[3].value());
     EXPECT_TRUE(resp[4].value());
+}
+
+TEST_F(MasterServiceTest, CheckpointMetadataPreservesVisibilityAndLease) {
+    auto config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(180000).build();
+    MasterService service(config);
+    const auto segment = PrepareSimpleSegment(service);
+    const auto client = segment.client_id;
+    PutCompletedObject(service, client, "checkpoint", ReplicateConfig{});
+    const auto tenant = TenantId::Default();
+    const auto lease = CheckpointLease(service, "checkpoint");
+    for (const int flags :
+         {int(kCheckpointLineage), int(kCheckpointRetired), 0}) {
+        auto result = service.BatchCheckpointMetadata({"checkpoint", "absent"},
+                                                      flags, tenant);
+        ASSERT_EQ(result.size(), 2U);
+        ASSERT_TRUE(result[0].has_value());
+        EXPECT_NE(*result[0] & kCheckpointReady, 0);
+        ASSERT_FALSE(result[1].has_value());
+        EXPECT_EQ(result[1].error(), ErrorCode::OBJECT_NOT_FOUND);
+        EXPECT_EQ(CheckpointLease(service, "checkpoint"), lease);
+    }
+    auto result = service.BatchCheckpointMetadata({"checkpoint"}, 0, tenant);
+    EXPECT_EQ(result[0].value(),
+              kCheckpointReady | kCheckpointLineage | kCheckpointRetired);
+    CheckCheckpointOpLogRoundTrip(service, "checkpoint",
+                                  kCheckpointLineage | kCheckpointRetired);
+    // Superseded is provenance only: a previously selected reader still loads.
+    EXPECT_TRUE(service.ExistKey("checkpoint", tenant).value());
+    EXPECT_TRUE(service.GetReplicaList("checkpoint", tenant).has_value());
+    auto removed = service.BatchRemove({"checkpoint"}, tenant, false);
+    EXPECT_FALSE(removed[0].has_value());
+    EXPECT_EQ(service.GetKeyCount(), 1U);
+    // Explicit cache deletion and recreation cannot inherit an old label.
+    ASSERT_TRUE(
+        service.BatchRemove({"checkpoint"}, tenant, true)[0].has_value());
+    PutCompletedObject(service, client, "checkpoint", ReplicateConfig{});
+    EXPECT_EQ(
+        service.BatchCheckpointMetadata({"checkpoint"}, 0, tenant)[0].value(),
+        kCheckpointReady);
+}
+
+TEST_F(MasterServiceTest,
+       CheckpointMetadataIsTenantScopedAndRejectsIncompleteWrites) {
+    const TenantId other("checkpoint-tenant");
+    MasterService service(MakeStrictTenantConfig({"default", other.value()}));
+    const auto segment = PrepareSimpleSegment(service);
+    PutCompletedObject(service, segment.client_id, "same", ReplicateConfig{});
+    PutCompletedObject(service, segment.client_id, "same", other,
+                       ReplicateConfig{});
+    auto result =
+        service.BatchCheckpointMetadata({"same"}, kCheckpointAnchor, other);
+    ASSERT_TRUE(result[0].has_value());
+    EXPECT_EQ(*result[0], kCheckpointReady | kCheckpointAnchor);
+    EXPECT_EQ(
+        service.BatchCheckpointMetadata({"same"}, 0, TenantId::Default())[0]
+            .value(),
+        kCheckpointReady);
+    ASSERT_TRUE(service
+                    .PutStart(segment.client_id, "pending", other, 1024,
+                              ReplicateConfig{})
+                    .has_value());
+    auto pending =
+        service.BatchCheckpointMetadata({"pending"}, kCheckpointLineage, other);
+    ASSERT_FALSE(pending[0].has_value());
+    EXPECT_EQ(pending[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_EQ(service.BatchCheckpointMetadata({"pending"}, 0, other)[0].value(),
+              0);
+    for (const int invalid : {-1, 8, 256}) {
+        auto bad = service.BatchCheckpointMetadata({"same", "missing"}, invalid,
+                                                   other);
+        ASSERT_EQ(bad.size(), 2U);
+        for (const auto& item : bad) {
+            ASSERT_FALSE(item.has_value());
+            EXPECT_EQ(item.error(), ErrorCode::INVALID_PARAMS);
+        }
+    }
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTenantAwarePreservesOrder) {

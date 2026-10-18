@@ -340,6 +340,9 @@ class RealClient : public PyClient {
 
     long removeAll(bool force = false);
 
+    std::vector<int> batchCheckpointMetadata(
+        const std::vector<std::string> &keys, int add_flags = 0) override;
+
     std::vector<int> batchRemove(const std::vector<std::string> &keys,
                                  bool force = false);
 
@@ -726,6 +729,9 @@ class RealClient : public PyClient {
                                                          bool force = false);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
+
+    std::vector<tl::expected<int, ErrorCode>> batchCheckpointMetadata_internal(
+        const std::vector<std::string> &keys, int add_flags);
 
     std::vector<tl::expected<void, ErrorCode>> batchRemove_internal(
         const std::vector<std::string> &keys, bool force = false);

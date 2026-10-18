@@ -2255,6 +2255,25 @@ long RealClient::removeAll(bool force) {
     return to_py_ret(removeAll_internal(force));
 }
 
+std::vector<tl::expected<int, ErrorCode>>
+RealClient::batchCheckpointMetadata_internal(
+    const std::vector<std::string> &keys, int add_flags) {
+    if (!client_) {
+        return std::vector<tl::expected<int, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->BatchCheckpointMetadata(keys, add_flags);
+}
+
+std::vector<int> RealClient::batchCheckpointMetadata(
+    const std::vector<std::string> &keys, int add_flags) {
+    auto internal = batchCheckpointMetadata_internal(keys, add_flags);
+    std::vector<int> results;
+    results.reserve(internal.size());
+    for (const auto &result : internal) results.push_back(to_py_ret(result));
+    return results;
+}
+
 std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
     const std::vector<std::string> &keys, bool force) {
     if (!client_) {

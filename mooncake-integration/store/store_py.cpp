@@ -2368,6 +2368,19 @@ PYBIND11_MODULE(store, m) {
             "Remove all objects from the store. If force=True, skip lease "
             "and replication task checks.")
         .def(
+            "batch_checkpoint_metadata",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys, int add_flags) {
+                py::gil_scoped_release release;
+                return self.store_->batchCheckpointMetadata(keys, add_flags);
+            },
+            py::arg("keys"), py::arg("add_flags") = 0,
+            "Read or OR checkpoint provenance into resident completed objects. "
+            "Flags: anchor=1, lineage=2, superseded=4; returned ready bit=8. "
+            "Negative results are Store errors. Never changes leases, read "
+            "visibility, or deletion policy. Metadata lasts until object "
+            "removal.")
+        .def(
             "batch_remove",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys, bool force) {
