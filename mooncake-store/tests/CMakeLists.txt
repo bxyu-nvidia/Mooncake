@@ -57,6 +57,12 @@ if(ENABLE_KV_EVENTS)
 endif()
 add_subdirectory(master_service)
 
+# Metadata inventory is header-only and does not need the store/RDMA runtime.
+add_executable(cache_inventory_test cache_inventory_test.cpp)
+target_include_directories(cache_inventory_test PRIVATE ../include)
+target_link_libraries(cache_inventory_test PRIVATE gtest gtest_main)
+add_test(NAME cache_inventory_test COMMAND cache_inventory_test)
+
 add_store_test(master_service_test master_service_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)
