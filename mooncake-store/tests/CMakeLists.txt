@@ -54,6 +54,9 @@ add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
 add_store_test(master_config_test master_config_test.cpp)
+add_store_test(cache_trace_test cache_trace_test.cpp)
+set_tests_properties(cache_trace_test PROPERTIES ENVIRONMENT
+                                                 "MOONCAKE_CACHE_TRACE=1")
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_store_test(replica_selection_config_test replica_selection_config_test.cpp)
 set_tests_properties(replica_selection_test

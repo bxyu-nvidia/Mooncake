@@ -59,6 +59,9 @@ struct ObjectMetadata {
 
     // RAII-style metric management
     ~ObjectMetadata() {
+        for (auto& part : parts_)
+            for (auto& replica : part.replicas())
+                replica.TraceRetired("object_destroyed");
         MasterMetricManager::instance().dec_key_count(1);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().dec_soft_pin_key_count(1);
@@ -92,6 +95,8 @@ struct ObjectMetadata {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
         }
         MasterMetricManager::instance().observe_value_size(value_length);
+        for (auto& replica : MutablePart(0).replicas())
+            replica.AttachCacheTrace(user_key, tenant_id.value());
     }
 
     ObjectMetadata(const ObjectMetadata&) = delete;
@@ -225,18 +230,25 @@ struct ObjectMetadata {
     // with `parts()` and a flattened `replicas()` view, so each call site says
     // which it means.
     void AddReplicas(std::vector<Replica>&& replicas) {
+        for (auto& replica : replicas)
+            replica.AttachCacheTrace(user_key, tenant_id.value());
         MutablePart(0).AddReplicas(std::move(replicas));
     }
 
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn);
+        auto replicas = MutablePart(0).PopReplicas(pred_fn);
+        for (auto& replica : replicas)
+            replica.TraceRetired("detached_from_object");
+        return replicas;
     }
 
-    std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
+    std::vector<Replica> PopReplicas() {
+        return PopReplicas([](const Replica&) { return true; });
+    }
 
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        return MutablePart(0).PopReplicas(pred_fn).size();
+        return PopReplicas(pred_fn).size();
     }
 
     // visit_fn may modify the replica but must not add or pop replicas.
