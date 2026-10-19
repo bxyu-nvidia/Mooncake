@@ -3000,6 +3000,10 @@ bool MasterService::ReadExistence(const ObjectMetadata& metadata,
         // refreshed.
         metadata.GrantReadLease(
             std::chrono::milliseconds(default_kv_lease_ttl_));
+        // Read-only probes must not inflate the lease-granting lookup count.
+        if (metadata.cache_trace)
+            metadata.cache_trace->lookup_hits.fetch_add(
+                1, std::memory_order_relaxed);
     }
     return true;
 }
@@ -4784,6 +4788,9 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
         MasterMetricManager::instance().inc_file_cache_hit_bytes(
             static_cast<int64_t>(metadata.TotalLength()));
     }
+    if (metadata.cache_trace)
+        metadata.cache_trace->read_requests.fetch_add(
+            1, std::memory_order_relaxed);
     MasterMetricManager::instance().inc_valid_get_nums();
     // Grant a lease to the object so it will not be removed
     // when the client is reading it. Read path is group-agnostic: only the

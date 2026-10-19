@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache_trace.h"
 #include "common/heap_optional.h"
 #include "lease.h"
 #include "master_metric_manager.h"
@@ -59,9 +60,7 @@ struct ObjectMetadata {
 
     // RAII-style metric management
     ~ObjectMetadata() {
-        for (auto& part : parts_)
-            for (auto& replica : part.replicas())
-                replica.TraceRetired("object_destroyed");
+        if (cache_trace) cache_trace->Removed(user_key, tenant_id.value());
         MasterMetricManager::instance().dec_key_count(1);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().dec_soft_pin_key_count(1);
@@ -95,14 +94,16 @@ struct ObjectMetadata {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
         }
         MasterMetricManager::instance().observe_value_size(value_length);
-        for (auto& replica : MutablePart(0).replicas())
-            replica.AttachCacheTrace(user_key, tenant_id.value());
+        if (CacheTraceEnabled() && !user_key.empty())
+            cache_trace = std::make_unique<CacheObjectTrace>();
     }
 
     ObjectMetadata(const ObjectMetadata&) = delete;
     ObjectMetadata& operator=(const ObjectMetadata&) = delete;
     ObjectMetadata(ObjectMetadata&&) = delete;
     ObjectMetadata& operator=(ObjectMetadata&&) = delete;
+
+    std::unique_ptr<CacheObjectTrace> cache_trace;
 
     // Updated by UpsertStart (Case B) to reflect the new writer.
     UUID client_id;
@@ -230,25 +231,18 @@ struct ObjectMetadata {
     // with `parts()` and a flattened `replicas()` view, so each call site says
     // which it means.
     void AddReplicas(std::vector<Replica>&& replicas) {
-        for (auto& replica : replicas)
-            replica.AttachCacheTrace(user_key, tenant_id.value());
         MutablePart(0).AddReplicas(std::move(replicas));
     }
 
     std::vector<Replica> PopReplicas(
         const std::function<bool(const Replica&)>& pred_fn) {
-        auto replicas = MutablePart(0).PopReplicas(pred_fn);
-        for (auto& replica : replicas)
-            replica.TraceRetired("detached_from_object");
-        return replicas;
+        return MutablePart(0).PopReplicas(pred_fn);
     }
 
-    std::vector<Replica> PopReplicas() {
-        return PopReplicas([](const Replica&) { return true; });
-    }
+    std::vector<Replica> PopReplicas() { return MutablePart(0).PopReplicas(); }
 
     size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
-        return PopReplicas(pred_fn).size();
+        return MutablePart(0).PopReplicas(pred_fn).size();
     }
 
     // visit_fn may modify the replica but must not add or pop replicas.
