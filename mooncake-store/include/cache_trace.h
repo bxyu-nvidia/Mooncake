@@ -29,11 +29,8 @@ inline int64_t CacheTraceNowNs() {
 }
 
 struct CacheRemovalRecord {
-    int schema_version{2};
     std::string event{"hash_removed"};
-    std::string medium{"Mooncake"};
     std::string instance_id;
-    std::string run_id;
     uint64_t sequence{0};
     std::string object_key;
     std::string prefix_hash;
@@ -44,9 +41,9 @@ struct CacheRemovalRecord {
     uint64_t lookup_hit_count{0};
     // Successful replica-list responses, not confirmed data transfers/resumes.
     uint64_t read_request_count{0};
-    YLT_REFL(CacheRemovalRecord, schema_version, event, medium, instance_id,
-             run_id, sequence, object_key, prefix_hash, tenant_id, created_ns,
-             removed_ns, lifetime_ns, lookup_hit_count, read_request_count);
+    YLT_REFL(CacheRemovalRecord, event, instance_id, sequence, object_key,
+             prefix_hash, tenant_id, created_ns, removed_ns, lifetime_ns,
+             lookup_hit_count, read_request_count);
 };
 
 // One instance per object key, shared by all its replicas. Readers hold shared
@@ -70,8 +67,6 @@ class CacheObjectTrace {
             CacheRemovalRecord record;
             record.instance_id = instance_id;
             record.sequence = ++sequence;
-            if (const char* run = std::getenv("VLLM_MAMBA_CACHE_TRACE_RUN_ID"))
-                record.run_id = run;
             record.object_key = key;
             const auto separator = key.rfind('@');
             if (separator != std::string::npos)
