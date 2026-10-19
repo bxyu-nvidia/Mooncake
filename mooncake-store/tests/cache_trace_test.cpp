@@ -33,6 +33,7 @@ TEST(CacheTraceTest, OnlyRemovalEmitsAccumulatedCounts) {
     const std::string marker = "MAMBA_CACHE_TRACE ";
     const auto start = log.find(marker);
     ASSERT_NE(start, std::string::npos);
+    EXPECT_EQ(log.find("instance_id"), std::string::npos);
     EXPECT_EQ(log.find(marker, start + marker.size()), std::string::npos);
     CacheRemovalRecord record;
     struct_json::from_json(record, log.substr(start + marker.size()));
@@ -42,8 +43,9 @@ TEST(CacheTraceTest, OnlyRemovalEmitsAccumulatedCounts) {
     EXPECT_EQ(record.tenant_id, "tenant");
     EXPECT_EQ(record.lookup_hit_count, 2000);
     EXPECT_EQ(record.read_request_count, 1000);
-    EXPECT_GE(record.removed_ns, record.created_ns);
-    EXPECT_GE(record.lifetime_ns, 0);
+    EXPECT_EQ(log.find("created_ns"), std::string::npos);
+    EXPECT_EQ(log.find("removed_ns"), std::string::npos);
+    EXPECT_EQ(log.find("lifetime_ns"), std::string::npos);
 }
 
 }  // namespace
