@@ -29,6 +29,7 @@
 
 #include "allocation_strategy.h"
 #include "background_worker.h"
+#include "cache_trace.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
@@ -1046,6 +1047,7 @@ class MasterService {
 
         // RAII-style metric management
         ~ObjectMetadata() {
+            if (cache_trace) cache_trace->Removed(user_key, tenant_id.value());
             MasterMetricManager::instance().dec_key_count(1);
             if (soft_pin_timeout) {
                 MasterMetricManager::instance().dec_soft_pin_key_count(1);
@@ -1080,12 +1082,16 @@ class MasterService {
                 MasterMetricManager::instance().inc_soft_pin_key_count(1);
             }
             MasterMetricManager::instance().observe_value_size(value_length);
+            if (CacheTraceEnabled() && !user_key.empty())
+                cache_trace = std::make_unique<CacheObjectTrace>();
         }
 
         ObjectMetadata(const ObjectMetadata&) = delete;
         ObjectMetadata& operator=(const ObjectMetadata&) = delete;
         ObjectMetadata(ObjectMetadata&&) = delete;
         ObjectMetadata& operator=(ObjectMetadata&&) = delete;
+
+        std::unique_ptr<CacheObjectTrace> cache_trace;
 
         // Updated by UpsertStart (Case B) to reflect the new writer.
         UUID client_id;

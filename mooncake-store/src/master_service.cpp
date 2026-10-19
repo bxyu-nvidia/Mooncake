@@ -2792,6 +2792,9 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     } else {
         metadata.GrantReadLease(default_kv_lease_ttl_);
     }
+    if (metadata.cache_trace)
+        metadata.cache_trace->lookup_hits.fetch_add(1,
+                                                    std::memory_order_relaxed);
     return true;
 }
 
@@ -2857,6 +2860,9 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
                 continue;
             }
             GrantLeaseForGroup(tenant_state, key, metadata);
+            if (metadata.cache_trace)
+                metadata.cache_trace->lookup_hits.fetch_add(
+                    1, std::memory_order_relaxed);
             results[i] = true;
         }
     }
@@ -3678,6 +3684,9 @@ auto MasterService::GetReplicaList(const std::string& key,
             MasterMetricManager::instance().inc_file_cache_hit_bytes(
                 static_cast<int64_t>(metadata.size));
         }
+        if (metadata.cache_trace)
+            metadata.cache_trace->read_requests.fetch_add(
+                1, std::memory_order_relaxed);
         MasterMetricManager::instance().inc_valid_get_nums();
         // Grant a lease to the object so it will not be removed
         // when the client is reading it.
@@ -3869,6 +3878,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     MasterMetricManager::instance().inc_file_cache_hit_bytes(
                         static_cast<int64_t>(metadata.size));
                 }
+                if (metadata.cache_trace)
+                    metadata.cache_trace->read_requests.fetch_add(
+                        1, std::memory_order_relaxed);
                 MasterMetricManager::instance().inc_valid_get_nums();
                 GrantLeaseForGroup(tenant_state, key, metadata);
 
