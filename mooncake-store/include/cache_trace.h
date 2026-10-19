@@ -2,17 +2,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 #pragma once
 
-#include <chrono>
 #include <atomic>
-#include <cstdlib>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
-#include <optional>
 #include <string>
 #include <unistd.h>
 #include <glog/logging.h>
 #include <ylt/struct_json/json_writer.h>
-#include "tenant_id.h"
 
 namespace mooncake {
 
@@ -30,104 +28,78 @@ inline int64_t CacheTraceNowNs() {
         .count();
 }
 
-inline uint64_t CacheTraceSequence() {
-    static std::atomic<uint64_t> sequence{0};
-    return ++sequence;
-}
-
-// Travels with a replica through staging lists and vector moves. The object key
-// joins these records to vLLM's request/transfer records without an extra RPC.
-struct CacheReplicaTrace {
-    int schema_version{1};
-    uint64_t sequence{0};
-    std::string event;
+struct CacheRemovalRecord {
+    int schema_version{2};
+    std::string event{"hash_removed"};
+    std::string medium{"Mooncake"};
     std::string instance_id;
     std::string run_id;
+    uint64_t sequence{0};
     std::string object_key;
+    std::string prefix_hash;
     std::string tenant_id;
-    uint64_t replica_id{0};
-    std::string tier;
-    std::string descriptor_json;
-    int64_t timestamp_ns{0};
-    int64_t attached_ns{CacheTraceNowNs()};
-    std::optional<int64_t> committed_ns;
-    std::optional<int64_t> retired_ns;
-    std::optional<int64_t> storage_reclaimed_ns;
-    std::string reason;
-    int64_t observed_lifetime_ns{0};
-    std::chrono::steady_clock::time_point birth{
-        std::chrono::steady_clock::now()};
+    int64_t created_ns{0};
+    int64_t removed_ns{0};
+    int64_t lifetime_ns{0};
+    uint64_t lookup_hit_count{0};
+    // Successful replica-list responses, not confirmed data transfers/resumes.
+    uint64_t read_request_count{0};
+    YLT_REFL(CacheRemovalRecord, schema_version, event, medium, instance_id,
+             run_id, sequence, object_key, prefix_hash, tenant_id, created_ns,
+             removed_ns, lifetime_ns, lookup_hit_count, read_request_count);
+};
 
-    YLT_REFL(CacheReplicaTrace, schema_version, sequence, event, instance_id,
-             run_id, object_key, tenant_id, replica_id, tier, descriptor_json,
-             timestamp_ns, attached_ns, committed_ns, retired_ns,
-             storage_reclaimed_ns, reason, observed_lifetime_ns);
+// One instance per object key, shared by all its replicas. Readers hold shared
+// metadata locks, so the counters must be atomic. Only object removal emits.
+class CacheObjectTrace {
+   public:
+    std::atomic<uint64_t> lookup_hits{0};
+    std::atomic<uint64_t> read_requests{0};
 
-    static const std::string& InstanceId() {
-        static const std::string value = [] {
-            char host[256]{};
-            gethostname(host, sizeof(host) - 1);
-            return std::string(host) + ":" + std::to_string(getpid()) + ":" +
-                   std::to_string(CacheTraceNowNs());
-        }();
-        return value;
-    }
-
-    void Emit(const char* kind) noexcept {
+    void Removed(const std::string& key, const std::string& tenant) noexcept {
+        if (emitted_) return;
+        emitted_ = true;
         try {
-            event = kind;
-            sequence = CacheTraceSequence();
-            instance_id = InstanceId();
-            if (const char* value =
-                    std::getenv("VLLM_MAMBA_CACHE_TRACE_RUN_ID")) {
-                run_id = value;
-            }
-            timestamp_ns = CacheTraceNowNs();
-            observed_lifetime_ns =
+            static std::atomic<uint64_t> sequence{0};
+            static const std::string instance_id = [] {
+                char host[256]{};
+                gethostname(host, sizeof(host) - 1);
+                return std::string(host) + ":" + std::to_string(getpid()) +
+                       ":" + std::to_string(CacheTraceNowNs());
+            }();
+            CacheRemovalRecord record;
+            record.instance_id = instance_id;
+            record.sequence = ++sequence;
+            if (const char* run = std::getenv("VLLM_MAMBA_CACHE_TRACE_RUN_ID"))
+                record.run_id = run;
+            record.object_key = key;
+            const auto separator = key.rfind('@');
+            if (separator != std::string::npos)
+                record.prefix_hash = key.substr(separator + 1);
+            record.tenant_id = tenant;
+            record.created_ns = created_ns_;
+            record.removed_ns = CacheTraceNowNs();
+            record.lifetime_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - birth)
+                    std::chrono::steady_clock::now() - birth_)
                     .count();
+            record.lookup_hit_count =
+                lookup_hits.load(std::memory_order_relaxed);
+            record.read_request_count =
+                read_requests.load(std::memory_order_relaxed);
             std::string json;
-            struct_json::to_json(*this, json);
+            struct_json::to_json(record, json);
             LOG(INFO) << "MAMBA_CACHE_TRACE " << json;
         } catch (const std::exception& e) {
             LOG(WARNING) << "Cache trace serialization failed: " << e.what();
         }
     }
-};
 
-struct CacheStorageReclaimed {
-    int schema_version{1};
-    uint64_t sequence{CacheTraceSequence()};
-    std::string event{"mooncake_storage_reclaimed"};
-    std::string instance_id{CacheReplicaTrace::InstanceId()};
-    std::string run_id;
-    std::string object_key;
-    std::string tenant_id;
-    std::string tier{"local_disk"};
-    std::string path;
-    int64_t storage_reclaimed_ns{CacheTraceNowNs()};
-    std::string reason;
-    YLT_REFL(CacheStorageReclaimed, schema_version, sequence, event,
-             instance_id, run_id, object_key, tenant_id, tier, path,
-             storage_reclaimed_ns, reason);
+   private:
+    const int64_t created_ns_{CacheTraceNowNs()};
+    const std::chrono::steady_clock::time_point birth_{
+        std::chrono::steady_clock::now()};
+    bool emitted_{false};
 };
-
-inline void TraceStorageReclaimed(const std::string& storage_key,
-                                  const std::string& path, const char* reason) {
-    if (!CacheTraceEnabled()) return;
-    auto [tenant, key] = TenantId::ParseScopedKey(storage_key);
-    CacheStorageReclaimed record;
-    record.object_key = key;
-    record.tenant_id = tenant.value();
-    record.path = path;
-    record.reason = reason;
-    if (const char* value = std::getenv("VLLM_MAMBA_CACHE_TRACE_RUN_ID")) {
-        record.run_id = value;
-    }
-    std::string json;
-    struct_json::to_json(record, json);
-    LOG(INFO) << "MAMBA_CACHE_TRACE " << json;
-}
 
 }  // namespace mooncake

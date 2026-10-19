@@ -18,7 +18,6 @@
 
 #include "types.h"
 #include "allocator.h"
-#include "cache_trace.h"
 #include "master_metric_manager.h"
 
 namespace mooncake {
@@ -309,30 +308,6 @@ class Replica {
           status_(status),
           refcnt_(0) {}
 
-    void AttachCacheTrace(const std::string& key, const std::string& tenant) {
-        if (!CacheTraceEnabled() || cache_trace_ || key.empty()) return;
-        cache_trace_ = std::make_unique<CacheReplicaTrace>();
-        cache_trace_->object_key = key;
-        cache_trace_->tenant_id = tenant;
-        cache_trace_->replica_id = id_;
-        cache_trace_->tier = is_memory_replica()       ? "memory"
-                             : is_nof_replica()        ? "nof_ssd"
-                             : is_local_disk_replica() ? "local_disk"
-                             : is_disk_replica()       ? "disk"
-                                                       : "dfs";
-        struct_json::to_json(get_descriptor(), cache_trace_->descriptor_json);
-        if (is_completed()) cache_trace_->committed_ns = CacheTraceNowNs();
-        cache_trace_->Emit("mooncake_replica_attached");
-    }
-
-    void TraceRetired(const char* reason) {
-        if (!cache_trace_ || cache_trace_->retired_ns) return;
-        cache_trace_->retired_ns = CacheTraceNowNs();
-        cache_trace_->reason = reason;
-        struct_json::to_json(get_descriptor(), cache_trace_->descriptor_json);
-        cache_trace_->Emit("mooncake_replica_retired");
-    }
-
     ~Replica() {
         if (status_ == ReplicaStatus::UNDEFINED) return;
         if (is_disk_replica()) {
@@ -342,7 +317,6 @@ class Replica {
             MasterMetricManager::instance().dec_allocated_file_size(
                 std::get<LocalDiskReplicaData>(data_).object_size);
         }
-        ReleaseCacheTrace();
     }
 
     // Copy-construction is not allowed.
@@ -354,8 +328,7 @@ class Replica {
         : id_(src.id_),
           data_(std::move(src.data_)),
           status_(src.status_),
-          refcnt_(src.refcnt_.exchange(0)),
-          cache_trace_(std::move(src.cache_trace_)) {
+          refcnt_(src.refcnt_.exchange(0)) {
         // Mark the source as moved-from so its destructor doesn't
         // double-decrement metrics.
         src.status_ = ReplicaStatus::UNDEFINED;
@@ -378,12 +351,10 @@ class Replica {
             }
         }
 
-        ReleaseCacheTrace();
         id_ = src.id_;
         data_ = std::move(src.data_);
         status_ = src.status_;
         refcnt_.store(src.refcnt_.exchange(0));
-        cache_trace_ = std::move(src.cache_trace_);
         // Mark src as moved-from.
         src.status_ = ReplicaStatus::UNDEFINED;
 
@@ -540,12 +511,6 @@ class Replica {
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::COMPLETE;
-            if (cache_trace_) {
-                cache_trace_->committed_ns = CacheTraceNowNs();
-                struct_json::to_json(get_descriptor(),
-                                     cache_trace_->descriptor_json);
-                cache_trace_->Emit("mooncake_replica_committed");
-            }
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
         } else {
@@ -565,7 +530,6 @@ class Replica {
         if (status_ == ReplicaStatus::COMPLETE ||
             status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::REMOVED;
-            TraceRetired("marked_removed");
         } else if (status_ == ReplicaStatus::REMOVED) {
             LOG(WARNING) << "Replica already marked as removed";
         } else {
@@ -730,23 +694,6 @@ class Replica {
     };
 
    private:
-    void ReleaseCacheTrace() {
-        if (!cache_trace_) return;
-        TraceRetired("replica_destroyed");
-        // Only the master's allocator-backed replicas have a reclamation
-        // completion observable here. Deleting disk metadata does not prove
-        // that a remote file has been deleted.
-        if (is_memory_replica()) {
-            std::get<MemoryReplicaData>(data_).buffer.reset();
-            cache_trace_->storage_reclaimed_ns = CacheTraceNowNs();
-        } else if (is_nof_replica()) {
-            std::get<NoFReplicaData>(data_).buffer.reset();
-            cache_trace_->storage_reclaimed_ns = CacheTraceNowNs();
-        }
-        cache_trace_->Emit("mooncake_replica_released");
-        cache_trace_.reset();
-    }
-
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
@@ -758,7 +705,6 @@ class Replica {
     friend class Serializer<Replica>;
     friend class MasterService;  // For MetadataSerializer to access next_id_
     std::atomic<uint32_t> refcnt_{0};
-    std::unique_ptr<CacheReplicaTrace> cache_trace_;
 };
 
 inline Replica::Descriptor Replica::get_descriptor() const {

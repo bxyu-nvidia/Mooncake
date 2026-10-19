@@ -1,6 +1,5 @@
 #include "serializer.h"
 #include "storage_backend.h"
-#include "cache_trace.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -1142,7 +1141,6 @@ tl::expected<void, ErrorCode> StorageBackend::DeleteEvictedFile(
     }
     if (was_replaced) {
         ReleaseSpace(record.size);
-        TraceStorageReclaimed(record.key, record.path, "file_replaced");
         return {};
     }
 
@@ -1155,8 +1153,6 @@ tl::expected<void, ErrorCode> StorageBackend::DeleteEvictedFile(
             pending_eviction_paths_.erase(record.path);
         }
         ReleaseSpace(record.size);
-        TraceStorageReclaimed(record.key, record.path,
-                              "file_removed_or_absent");
         return {};
     }
 
@@ -3430,11 +3426,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     // Step 3: Safe to delete files now - no readers are using them
     std::error_code ec;
 
-    bool data_removed = false;
     auto data_path_res = GetBucketDataPath(bucket_id);
     if (data_path_res) {
         fs::remove(data_path_res.value(), ec);
-        data_removed = !ec || ec == std::errc::no_such_file_or_directory;
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(WARNING) << "DeleteBucket: failed to remove data file: "
                          << data_path_res.value()
@@ -3453,12 +3447,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         }
     }
 
-    if (data_removed && CacheTraceEnabled()) {
-        for (const auto& key : keys_to_remove) {
-            TraceStorageReclaimed(key, data_path_res.value(),
-                                  "bucket_data_removed_or_absent");
-        }
-    }
     LOG(INFO) << "DeleteBucket: successfully deleted bucket_id=" << bucket_id
               << ", keys_removed=" << keys_to_remove.size();
     return {};
