@@ -39,6 +39,9 @@ add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
+add_store_test(cache_trace_test cache_trace_test.cpp)
+set_tests_properties(cache_trace_test PROPERTIES ENVIRONMENT
+                                                 "MOONCAKE_CACHE_TRACE=1")
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_test(
   NAME replica_selection_env_opt_in_test

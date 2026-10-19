@@ -1046,6 +1046,8 @@ class MasterService {
 
         // RAII-style metric management
         ~ObjectMetadata() {
+            for (auto& replica : replicas_)
+                replica.TraceRetired("object_destroyed");
             MasterMetricManager::instance().dec_key_count(1);
             if (soft_pin_timeout) {
                 MasterMetricManager::instance().dec_soft_pin_key_count(1);
@@ -1080,6 +1082,9 @@ class MasterService {
                 MasterMetricManager::instance().inc_soft_pin_key_count(1);
             }
             MasterMetricManager::instance().observe_value_size(value_length);
+            for (auto& replica : replicas_) {
+                replica.AttachCacheTrace(user_key, tenant_id.value());
+            }
         }
 
         ObjectMetadata(const ObjectMetadata&) = delete;
@@ -1165,6 +1170,9 @@ class MasterService {
         }
 
         void AddReplicas(std::vector<Replica>&& replicas) {
+            for (auto& replica : replicas) {
+                replica.AttachCacheTrace(user_key, tenant_id.value());
+            }
             replicas_.insert(replicas_.end(),
                              std::move_iterator(replicas.begin()),
                              std::move_iterator(replicas.end()));
@@ -1182,6 +1190,9 @@ class MasterService {
             if (partition_point != replicas_.end()) {
                 popped_replicas.reserve(
                     std::distance(partition_point, replicas_.end()));
+                for (auto it = partition_point; it != replicas_.end(); ++it) {
+                    it->TraceRetired("detached_from_object");
+                }
                 std::move(partition_point, replicas_.end(),
                           std::back_inserter(popped_replicas));
                 replicas_.erase(partition_point, replicas_.end());
@@ -1190,7 +1201,11 @@ class MasterService {
             return popped_replicas;
         }
 
-        std::vector<Replica> PopReplicas() { return std::move(replicas_); }
+        std::vector<Replica> PopReplicas() {
+            for (auto& replica : replicas_)
+                replica.TraceRetired("detached_from_object");
+            return std::move(replicas_);
+        }
 
         size_t EraseReplicas(
             const std::function<bool(const Replica&)>& pred_fn) {
