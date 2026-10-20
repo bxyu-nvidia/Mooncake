@@ -3317,6 +3317,21 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
     return master_client_.BatchPutRevoke(keys, replica_type);
 }
 
+std::vector<tl::expected<int, ErrorCode>> Client::BatchReportMambaDirectUse(
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& event_ids) {
+    auto results = master_client_.BatchReportMambaDirectUse(keys, event_ids);
+    if (hot_cache_) {
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (results[i] && *results[i] == 1) {
+                hot_cache_->BumpKeyGeneration(keys[i]);
+                hot_cache_->RemoveHotKey(keys[i]);
+            }
+        }
+    }
+    return results;
+}
+
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);

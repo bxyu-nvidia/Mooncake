@@ -472,6 +472,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
 #endif
     }
 
+    mamba_direct_use_enabled_ =
+        Environ::GetBool("MOONCAKE_MAMBA_EVICT_ON_DIRECT_DESCENDANT", false);
+    if (mamba_direct_use_enabled_) {
+        LOG(INFO) << "Mamba direct-use eviction enabled; protection history "
+                     "lasts until master restart";
+    }
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -6425,6 +6431,34 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
+std::vector<tl::expected<int, ErrorCode>>
+MasterService::BatchReportMambaDirectUse(
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& event_ids, const TenantId& tenant_id) {
+    if (!mamba_direct_use_enabled_) {
+        return std::vector<tl::expected<int, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+    }
+    if (keys.size() != event_ids.size()) {
+        return std::vector<tl::expected<int, ErrorCode>>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    const auto& tenant = ResolveRequestTenantId(tenant_id);
+    std::vector<tl::expected<int, ErrorCode>> results;
+    results.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i].empty() || event_ids[i].empty()) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        results.emplace_back(mamba_direct_use_policy_.Report(
+            tenant.MakeScopedKey(keys[i]), event_ids[i], keys[i],
+            tenant.value()));
+    }
+    return results;
+}
+
 auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                            bool force) -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -9068,6 +9102,15 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
+        if (mamba_direct_use_enabled_) {
+            mamba_direct_use_policy_.Drain(
+                [this](const std::string& key, const std::string& tenant) {
+                    // Never bypass reader leases or incomplete writes.
+                    auto result = Remove(key, TenantId(tenant), false);
+                    return result.has_value() ||
+                           result.error() == ErrorCode::OBJECT_NOT_FOUND;
+                });
+        }
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||

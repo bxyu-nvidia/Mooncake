@@ -334,6 +334,10 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
+    std::vector<int> batchReportMambaDirectUse(
+        const std::vector<std::string> &keys,
+        const std::vector<std::string> &event_ids) override;
+
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);
@@ -729,6 +733,11 @@ class RealClient : public PyClient {
 
     std::vector<tl::expected<void, ErrorCode>> batchRemove_internal(
         const std::vector<std::string> &keys, bool force = false);
+
+    std::vector<tl::expected<int, ErrorCode>>
+    batchReportMambaDirectUse_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::string> &event_ids);
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 

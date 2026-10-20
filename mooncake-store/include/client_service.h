@@ -296,6 +296,10 @@ class Client {
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config, const WriteBufferStager& stager);
 
+    std::vector<tl::expected<int, ErrorCode>> BatchReportMambaDirectUse(
+        const std::vector<std::string>& keys,
+        const std::vector<std::string>& event_ids);
+
     /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove

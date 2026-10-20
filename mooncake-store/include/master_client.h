@@ -281,6 +281,10 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const std::vector<std::string>& keys);
 
+    std::vector<tl::expected<int, ErrorCode>> BatchReportMambaDirectUse(
+        const std::vector<std::string>& keys,
+        const std::vector<std::string>& event_ids);
+
     /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove

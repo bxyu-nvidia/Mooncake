@@ -827,6 +827,19 @@ WrappedMasterService::BatchUpsertRevoke(const UUID& client_id,
     return results;
 }
 
+std::vector<tl::expected<int, ErrorCode>>
+WrappedMasterService::BatchReportMambaDirectUse(
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& event_ids, const std::string& tenant_id) {
+    return WithRequestTenantBatch(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        keys.size(), [&](const TenantId& tenant) {
+            return master_service_.BatchReportMambaDirectUse(keys, event_ids,
+                                                             tenant);
+        });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
     const std::string& key, bool force, const std::string& tenant_id) {
     return execute_rpc(
@@ -1769,6 +1782,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchUpsertEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchUpsertRevoke>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchReportMambaDirectUse>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Remove>(
         &wrapped_master_service);

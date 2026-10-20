@@ -30,6 +30,7 @@
 #include "allocation_strategy.h"
 #include "background_worker.h"
 #include "cache_trace.h"
+#include "mamba_direct_use.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
@@ -657,6 +658,12 @@ class MasterService {
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const TenantId& tenant_id);
+
+    // Opt-in policy reports: 1 = deletion queued, 2 = protected.
+    // History survives object removal, but not master restart/failover.
+    std::vector<tl::expected<int, ErrorCode>> BatchReportMambaDirectUse(
+        const std::vector<std::string>& keys,
+        const std::vector<std::string>& event_ids, const TenantId& tenant_id);
 
     /**
      * @brief Remove an object and its replicas
@@ -2128,6 +2135,9 @@ class MasterService {
     const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+
+    bool mamba_direct_use_enabled_{false};
+    MambaDirectUsePolicy mamba_direct_use_policy_;
 
     // Eviction thread related members
     std::thread eviction_thread_;

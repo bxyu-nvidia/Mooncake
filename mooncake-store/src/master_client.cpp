@@ -123,6 +123,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchUpsertRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchReportMambaDirectUse> {
+    static constexpr const char* value = "BatchReportMambaDirectUse";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::Remove> {
     static constexpr const char* value = "Remove";
 };
@@ -752,6 +757,15 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertRevoke(
             keys.size(), client_id_, keys, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+std::vector<tl::expected<int, ErrorCode>>
+MasterClient::BatchReportMambaDirectUse(
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& event_ids) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchReportMambaDirectUse,
+                            int>(keys.size(), keys, event_ids,
+                                 tenant_id_.value());
 }
 
 tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,

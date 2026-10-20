@@ -389,6 +389,10 @@ class PyClient {
 
     [[nodiscard]] virtual std::string get_hostname() const = 0;
 
+    virtual std::vector<int> batchReportMambaDirectUse(
+        const std::vector<std::string> &keys,
+        const std::vector<std::string> &event_ids) = 0;
+
     virtual int remove(const std::string &key, bool force = false) = 0;
 
     virtual long removeByRegex(const std::string &str, bool force = false) = 0;

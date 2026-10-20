@@ -36,6 +36,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::put_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_batch_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_parts_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::batchReportMambaDirectUse_internal>(
+        &real_client);
     server.register_handler<&RealClient::remove_internal>(&real_client);
     server.register_handler<&RealClient::removeByRegex_internal>(&real_client);
     server.register_handler<&RealClient::removeAll_internal>(&real_client);

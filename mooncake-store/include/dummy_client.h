@@ -158,6 +158,10 @@ class DummyClient : public PyClient {
         return p >= base && p < base + hot_cache_size_;
     }
 
+    std::vector<int> batchReportMambaDirectUse(
+        const std::vector<std::string> &keys,
+        const std::vector<std::string> &event_ids) override;
+
     int remove(const std::string &key, bool force = false);
 
     long removeByRegex(const std::string &str, bool force = false);

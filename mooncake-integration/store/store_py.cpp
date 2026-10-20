@@ -2368,6 +2368,18 @@ PYBIND11_MODULE(store, m) {
             "Remove all objects from the store. If force=True, skip lease "
             "and replication task checks.")
         .def(
+            "batch_report_mamba_direct_use",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::string> &event_ids) {
+                py::gil_scoped_release release;
+                return self.store_->batchReportMambaDirectUse(keys, event_ids);
+            },
+            py::arg("keys"), py::arg("event_ids"),
+            "Report completed Mamba direct-child uses. Stable event IDs make "
+            "retries idempotent. Returns 1=pending removal, 2=protected, or a "
+            "negative error code. Requires master opt-in.")
+        .def(
             "batch_remove",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys, bool force) {

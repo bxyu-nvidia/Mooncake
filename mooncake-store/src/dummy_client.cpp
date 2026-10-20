@@ -870,6 +870,20 @@ int DummyClient::upsert_batch(const std::vector<std::string>& keys,
         true, keys, values, config, client_id_);
 }
 
+std::vector<int> DummyClient::batchReportMambaDirectUse(
+    const std::vector<std::string>& keys,
+    const std::vector<std::string>& event_ids) {
+    auto results =
+        invoke_batch_rpc<&RealClient::batchReportMambaDirectUse_internal, int>(
+            keys.size(), keys, event_ids);
+    std::vector<int> ret;
+    ret.reserve(results.size());
+    for (const auto& result : results) {
+        ret.push_back(to_py_ret(result));
+    }
+    return ret;
+}
+
 int DummyClient::remove(const std::string& key, bool force) {
     return to_py_ret(
         invoke_rpc<&RealClient::remove_internal, void>(key, force));

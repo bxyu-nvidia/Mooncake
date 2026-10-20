@@ -2226,6 +2226,29 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
     return {};
 }
 
+std::vector<tl::expected<int, ErrorCode>>
+RealClient::batchReportMambaDirectUse_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<std::string> &event_ids) {
+    if (!client_) {
+        return std::vector<tl::expected<int, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    return client_->BatchReportMambaDirectUse(keys, event_ids);
+}
+
+std::vector<int> RealClient::batchReportMambaDirectUse(
+    const std::vector<std::string> &keys,
+    const std::vector<std::string> &event_ids) {
+    auto results = batchReportMambaDirectUse_internal(keys, event_ids);
+    std::vector<int> ret;
+    ret.reserve(results.size());
+    for (const auto &result : results) {
+        ret.push_back(to_py_ret(result));
+    }
+    return ret;
+}
+
 int RealClient::remove(const std::string &key, bool force) {
     return to_py_ret(remove_internal(key, force));
 }

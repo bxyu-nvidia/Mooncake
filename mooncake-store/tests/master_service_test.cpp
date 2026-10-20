@@ -1272,6 +1272,74 @@ TEST_F(MasterServiceTest, PutStartGroupIdsValidation) {
     EXPECT_TRUE(exists.value());
 }
 
+TEST_F(MasterServiceTest, MambaDirectUseRequiresMasterOptIn) {
+    ScopedEnvVar env("MOONCAKE_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "0");
+    MasterService service(MasterServiceConfig::builder().build());
+    auto results = service.BatchReportMambaDirectUse({"key"}, {"use-a"},
+                                                     TenantId::Default());
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::NOT_SUPPORTED);
+}
+
+TEST_F(MasterServiceTest, MambaDirectUseHonorsLeaseAndPreservesProtection) {
+    ScopedEnvVar env("MOONCAKE_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "1");
+    MasterService service(
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(10000).build());
+    auto segment = PrepareSimpleSegment(service);
+    auto key = PutObjectOnSegment(service, segment.client_id, "test_segment");
+    ASSERT_TRUE(service.GetReplicaList(key, TenantId::Default()).has_value());
+    auto first = service.BatchReportMambaDirectUse({key}, {"use-a"},
+                                                   TenantId::Default());
+    ASSERT_EQ(first.size(), 1u);
+    ASSERT_TRUE(first[0].has_value());
+    EXPECT_EQ(*first[0], 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    EXPECT_TRUE(service.ExistKey(key, TenantId::Default()).value());
+    auto second = service.BatchReportMambaDirectUse({key}, {"use-b"},
+                                                    TenantId::Default());
+    ASSERT_TRUE(second[0].has_value());
+    EXPECT_EQ(*second[0], 2);
+    // Normal/admin removal is not blocked by policy protection.
+    ASSERT_TRUE(service.Remove(key, TenantId::Default(), true).has_value());
+    EXPECT_EQ(*service.BatchReportMambaDirectUse({key}, {"use-c"},
+                                                 TenantId::Default())[0],
+              2);
+}
+
+TEST_F(MasterServiceTest, MambaDirectUseWaitsForPutCompletion) {
+    ScopedEnvVar env("MOONCAKE_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "1");
+    MasterService service(
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(1).build());
+    auto segment = PrepareSimpleSegment(service);
+    const std::string key = "mamba-incomplete";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service
+            .PutStart(segment.client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            .BatchReportMambaDirectUse({key}, {"use-a"}, TenantId::Default())[0]
+            .has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    ASSERT_TRUE(service
+                    .PutEnd(segment.client_id, key, TenantId::Default(),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    // Avoid GetReplicaList, which would refresh the reader lease.
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto keys = service.GetAllKeys(TenantId::Default());
+        ASSERT_TRUE(keys.has_value());
+        if (std::find(keys->begin(), keys->end(), key) == keys->end()) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FAIL() << "pending Mamba removal was not drained after PutEnd";
+}
+
 TEST_F(MasterServiceTest, GroupedObjectRoutesKeyLevelLookupAndRemove) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
