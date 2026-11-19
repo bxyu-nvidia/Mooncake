@@ -80,6 +80,7 @@ struct MetadataStoragePlugin;
 // Forward declarations for test classes
 namespace test {
 class MasterServiceTest;
+class MasterServiceSSDTest;
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
 // Friended so the promotion-on-hit tests can drive a serialize/reset/
@@ -147,6 +148,7 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::MasterServiceTest;
+    friend class test::MasterServiceSSDTest;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
     friend class test::DynamicReplicationTest;
@@ -1074,6 +1076,7 @@ class MasterService {
               tenant_id(std::move(tenant_id_)),
               user_key(std::move(user_key_)),
               lease_timeout(),
+              memory_lease_timeout(),
               soft_pin_timeout(std::move(committed_soft_pin_timeout)),
               hard_pinned(enable_hard_pin),
               replicas_(std::move(reps)) {
@@ -1109,6 +1112,9 @@ class MasterService {
         // the Clock's epoch (i.e., time_since_epoch() is zero).
         mutable std::chrono::system_clock::time_point lease_timeout
             GUARDED_BY(lock);  // hard lease
+        mutable std::chrono::system_clock::time_point memory_lease_timeout
+            GUARDED_BY(
+                lock);  // protects memory descriptors returned to readers
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                                 // deadline
@@ -1325,18 +1331,31 @@ class MasterService {
 
         // Grant an ordinary read lease with timeout as now() + ttl. Soft-pin
         // lifetime is intentionally independent from reads.
-        void GrantReadLease(const uint64_t ttl) const {
+        void GrantReadLease(const uint64_t ttl,
+                            bool protect_memory = true) const {
             SpinLocker locker(&lock);
             std::chrono::system_clock::time_point now =
                 std::chrono::system_clock::now();
-            lease_timeout =
-                std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
+            const auto deadline = now + std::chrono::milliseconds(ttl);
+            lease_timeout = std::max(lease_timeout, deadline);
+            if (protect_memory) {
+                memory_lease_timeout = std::max(memory_lease_timeout, deadline);
+            }
         }
 
-        bool NeedsReadLeaseRefresh(const uint64_t ttl) const {
+        bool NeedsReadLeaseRefresh(const uint64_t ttl,
+                                   bool protect_memory = true) const {
             SpinLocker locker(&lock);
             const auto now = std::chrono::system_clock::now();
-            return lease_timeout <= now + std::chrono::milliseconds(ttl / 2);
+            const auto deadline =
+                protect_memory ? memory_lease_timeout : lease_timeout;
+            return deadline <= now + std::chrono::milliseconds(ttl / 2);
+        }
+
+        bool IsMemoryLeaseExpired(
+            const std::chrono::system_clock::time_point& now) const {
+            SpinLocker locker(&lock);
+            return now >= memory_lease_timeout;
         }
 
         // Check if the lease has expired
@@ -1743,6 +1762,9 @@ class MasterService {
 
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
+    bool IsMemoryEvictionLeaseExpired(
+        const ObjectMetadata& metadata,
+        std::chrono::system_clock::time_point& now) const;
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     void RebuildCacheTotalAccounting();
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
@@ -1951,7 +1973,8 @@ class MasterService {
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
-                            const ObjectMetadata& metadata) const;
+                            const ObjectMetadata& metadata,
+                            bool protect_memory = true) const;
     static void ApplySoftPinMetricDelta(int metric_delta);
     size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(

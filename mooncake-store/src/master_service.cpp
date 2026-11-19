@@ -1679,6 +1679,20 @@ bool MasterService::HasCompletedDiskCacheReplica(
     });
 }
 
+bool MasterService::IsMemoryEvictionLeaseExpired(
+    const ObjectMetadata& metadata,
+    std::chrono::system_clock::time_point& now) const {
+    // Existence checks retain the object, but need not retain its RAM copy
+    // after offload. Descriptor queries still protect in-flight RAM reads.
+    return metadata.IsLeaseExpired(now) ||
+           (metadata.IsMemoryLeaseExpired(now) &&
+            metadata.HasReplica([this](const Replica& replica) {
+                return (replica.is_disk_replica() ||
+                        replica.is_local_disk_replica()) &&
+                       IsReplicaReadable(replica);
+            }));
+}
+
 void MasterService::SyncCacheTotalAccounting(ObjectMetadata& metadata) {
     const bool has_memory_cache_replica =
         HasCompletedMemoryCacheReplica(metadata);
@@ -2455,13 +2469,18 @@ void MasterService::CleanupExpiredSoftPins(
 
 void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
                                        const std::string& key,
-                                       const ObjectMetadata& metadata) const {
+                                       const ObjectMetadata& metadata,
+                                       bool protect_memory) const {
     if (!metadata.IsGrouped()) {
-        metadata.GrantReadLease(default_kv_lease_ttl_);
+        metadata.GrantReadLease(default_kv_lease_ttl_, protect_memory);
         return;
     }
 
-    bool needs_refresh = metadata.NeedsReadLeaseRefresh(default_kv_lease_ttl_);
+    // Descriptor responses advertise a full TTL starting at this request.
+    // Only existence checks may reuse a partially elapsed group lease.
+    bool needs_refresh =
+        protect_memory ||
+        metadata.NeedsReadLeaseRefresh(default_kv_lease_ttl_, protect_memory);
     if (!needs_refresh) {
         std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
         needs_refresh =
@@ -2474,18 +2493,18 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
 
     auto group_it = tenant_state.group_members.find(metadata.group_id);
     if (group_it == tenant_state.group_members.end()) {
-        metadata.GrantReadLease(default_kv_lease_ttl_);
+        metadata.GrantReadLease(default_kv_lease_ttl_, protect_memory);
         return;
     }
 
     for (const auto& member_key : group_it->second) {
         auto mit = tenant_state.metadata.find(member_key);
         if (mit != tenant_state.metadata.end()) {
-            mit->second.GrantReadLease(default_kv_lease_ttl_);
+            mit->second.GrantReadLease(default_kv_lease_ttl_, protect_memory);
         }
     }
     if (group_it->second.find(key) == group_it->second.end()) {
-        metadata.GrantReadLease(default_kv_lease_ttl_);
+        metadata.GrantReadLease(default_kv_lease_ttl_, protect_memory);
     }
     {
         std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
@@ -2788,9 +2807,10 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     // Grant a lease to the object as it may be further used by the client.
     auto* ts = accessor.GetTenantState();
     if (ts) {
-        GrantLeaseForGroup(*ts, key, metadata);
+        GrantLeaseForGroup(*ts, key, metadata, /*protect_memory=*/false);
     } else {
-        metadata.GrantReadLease(default_kv_lease_ttl_);
+        metadata.GrantReadLease(default_kv_lease_ttl_,
+                                /*protect_memory=*/false);
     }
     if (metadata.cache_trace)
         metadata.cache_trace->lookup_hits.fetch_add(1,
@@ -2859,7 +2879,8 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
                 results[i] = false;
                 continue;
             }
-            GrantLeaseForGroup(tenant_state, key, metadata);
+            GrantLeaseForGroup(tenant_state, key, metadata,
+                               /*protect_memory=*/false);
             if (metadata.cache_trace)
                 metadata.cache_trace->lookup_hits.fetch_add(
                     1, std::memory_order_relaxed);
@@ -9850,7 +9871,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         for (const auto& member_key : group_it->second) {
             auto member_it = tenant_state.metadata.find(member_key);
             if (member_it != tenant_state.metadata.end() &&
-                !member_it->second.IsLeaseExpired(now)) {
+                !IsMemoryEvictionLeaseExpired(member_it->second, now)) {
                 return {};
             }
         }
@@ -9865,7 +9886,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             }
             auto& member_metadata = member_it->second;
             if (member_metadata.IsHardPinned() ||
-                !member_metadata.IsLeaseExpired(now) ||
+                !IsMemoryEvictionLeaseExpired(member_metadata, now) ||
                 (!allow_soft_pinned && IsSoftPinActive(member_metadata, now)) ||
                 !can_evict_replicas(member_metadata)) {
                 continue;
@@ -9903,7 +9924,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                      total.freed_bytes < target_bytes;) {
                     auto& metadata = it->second;
                     if (metadata.IsHardPinned() ||
-                        !metadata.IsLeaseExpired(now) ||
+                        !IsMemoryEvictionLeaseExpired(metadata, now) ||
                         (!allow_soft_pinned &&
                          IsSoftPinActive(metadata, now)) ||
                         !can_evict_replicas(metadata)) {
@@ -10216,7 +10237,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         for (const auto& member_key : group_it->second) {
             auto member_it = tenant_state.metadata.find(member_key);
             if (member_it != tenant_state.metadata.end() &&
-                !member_it->second.IsLeaseExpired(now)) {
+                !IsMemoryEvictionLeaseExpired(member_it->second, now)) {
                 return {};
             }
         }
@@ -10231,7 +10252,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
             auto& member_metadata = member_it->second;
             if (member_metadata.IsHardPinned() ||
-                !member_metadata.IsLeaseExpired(now) ||
+                !IsMemoryEvictionLeaseExpired(member_metadata, now) ||
                 (!allow_soft_pinned && IsSoftPinActive(member_metadata, now)) ||
                 !can_evict_replicas(member_metadata)) {
                 continue;
@@ -10323,7 +10344,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (it->second.IsHardPinned()) continue;
                         bool has_evictable = can_evict_replicas(it->second);
                         if (has_evictable) shard_evictable_count++;
-                        if (!it->second.IsLeaseExpired(now) || !has_evictable)
+                        if (!has_evictable ||
+                            !IsMemoryEvictionLeaseExpired(it->second, now))
                             continue;
                         if (!IsSoftPinActive(it->second, now)) {
                             if (compact_frontier_prebypass) {
@@ -10426,7 +10448,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         for (const auto& [key, metadata] :
                              tenant_state.metadata) {
                             if (metadata.IsHardPinned() ||
-                                !metadata.IsLeaseExpired(now) ||
+                                !IsMemoryEvictionLeaseExpired(metadata, now) ||
                                 IsSoftPinActive(metadata, now) ||
                                 !can_evict_replicas(metadata)) {
                                 continue;
@@ -10539,7 +10561,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     if (it == tenant_state.metadata.end()) continue;
 
                     // Re-validate: state may have changed since Phase 1
-                    if (!it->second.IsLeaseExpired(now) ||
+                    if (!IsMemoryEvictionLeaseExpired(it->second, now) ||
                         IsSoftPinActive(it->second, now) ||
                         !can_evict_replicas(it->second)) {
                         no_pin_objects.push_back(c.lease_timeout);
@@ -10630,7 +10652,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         while (it != tenant_state.metadata.end() &&
                                target_evict_num > 0) {
                             if (!it->second.IsHardPinned() &&
-                                it->second.IsLeaseExpired(now) &&
+                                IsMemoryEvictionLeaseExpired(it->second, now) &&
                                 it->second.lease_timeout <= target_timeout &&
                                 !IsSoftPinActive(it->second, now) &&
                                 can_evict_replicas(it->second)) {
@@ -10694,7 +10716,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         while (it != tenant_state.metadata.end() &&
                                target_evict_num > 0) {
                             if (it->second.IsHardPinned() ||
-                                !it->second.IsLeaseExpired(now) ||
+                                !IsMemoryEvictionLeaseExpired(it->second,
+                                                              now) ||
                                 !can_evict_replicas(it->second)) {
                                 ++it;
                                 continue;
@@ -11758,6 +11781,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->group_id, tenant_id, user_key));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
+        it->second.memory_lease_timeout = metadata_ptr->memory_lease_timeout;
         it->second.object_checksum = metadata_ptr->object_checksum;
 
         // Recompute disk_object_count for restored metadata
@@ -11979,6 +12003,8 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     metadata->object_checksum = object_checksum;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
+    // Legacy snapshots do not distinguish lookup and memory read leases.
+    metadata->memory_lease_timeout = metadata->lease_timeout;
 
     return metadata;
 }
