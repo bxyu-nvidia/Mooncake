@@ -9823,8 +9823,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         bool queued = false;
         metadata.VisitReplicas(
             is_evictable_memory_replica,
-            [this, &key, &normalized_tenant, &tenant_state, &queued,
-             &now](Replica& replica) {
+            [this, &key, &normalized_tenant, &tenant_state, &queued, &now,
+             &metadata](Replica& replica) {
                 if (queued) {
                     return;
                 }
@@ -10090,8 +10090,9 @@ MasterService::MemoryEvictionResult MasterService::BatchEvict(
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
         metadata.VisitReplicas(
-            is_evictable_memory_replica, [this, &tenant_id, &key, &tenant_state,
-                                          &queued, &now](Replica& replica) {
+            is_evictable_memory_replica,
+            [this, &tenant_id, &key, &tenant_state, &queued, &now,
+             &metadata](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
                 std::vector<UUID> mirror_clients;
                 auto result =
