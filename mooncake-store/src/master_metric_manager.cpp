@@ -331,6 +331,34 @@ MasterMetricManager::MasterMetricManager()
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
 
+      pending_offload_bytes_(
+          "master_offload_pending_bytes",
+          "RAM bytes pinned by queued or executing disk offloads"),
+      pending_offload_tasks_(
+          "master_offload_pending_objects",
+          "Number of queued or executing disk offload tasks"),
+      mem_eviction_scanned_(
+          "master_mem_eviction_scanned_total",
+          "Memory-resident candidates examined by bounded eviction passes"),
+      mem_eviction_lock_acquisitions_(
+          "master_mem_eviction_lock_acquisitions_total",
+          "Shard write locks acquired by memory eviction"),
+      mem_eviction_lock_wait_ms_(
+          "master_mem_eviction_lock_wait_ms",
+          "Total shard lock wait milliseconds per memory eviction pass",
+          {0, 0.1, 1, 5, 10, 25, 50, 100, 250, 1000}),
+      mem_eviction_lock_hold_ms_(
+          "master_mem_eviction_lock_hold_ms",
+          "Total shard lock hold milliseconds per memory eviction pass",
+          {0, 0.1, 1, 5, 10, 25, 50, 100, 250, 1000}),
+      mem_eviction_duration_ms_(
+          "master_mem_eviction_duration_ms",
+          "Elapsed milliseconds per bounded memory eviction pass",
+          {0, 0.1, 1, 5, 10, 25, 50, 100, 250, 1000}),
+      mem_eviction_backoff_ms_(
+          "master_mem_eviction_backoff_ms",
+          "Current memory eviction retry delay in milliseconds"),
+
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
                              "Total number of discarded PutStart operations"),
@@ -503,6 +531,11 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
     promotion_in_flight_metric_.update(0);
+    pending_offload_bytes_.update(0);
+    pending_offload_tasks_.update(0);
+    mem_eviction_backoff_ms_.update(0);
+    mem_eviction_scanned_.inc(0);
+    mem_eviction_lock_acquisitions_.inc(0);
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
@@ -1497,6 +1530,37 @@ int64_t MasterMetricManager::get_batch_put_revoke_failed_items() {
     return batch_put_revoke_failed_items_.value();
 }
 
+void MasterMetricManager::add_pending_offload(int64_t tasks, int64_t bytes) {
+    if (tasks >= 0)
+        pending_offload_tasks_.inc(tasks);
+    else
+        pending_offload_tasks_.dec(-tasks);
+    if (bytes >= 0)
+        pending_offload_bytes_.inc(bytes);
+    else
+        pending_offload_bytes_.dec(-bytes);
+}
+int64_t MasterMetricManager::get_pending_offload_bytes() {
+    return pending_offload_bytes_.value();
+}
+int64_t MasterMetricManager::get_pending_offload_tasks() {
+    return pending_offload_tasks_.value();
+}
+void MasterMetricManager::observe_mem_eviction_pass(uint64_t scanned,
+                                                    uint64_t acquisitions,
+                                                    double wait_ms,
+                                                    double hold_ms,
+                                                    double duration_ms) {
+    mem_eviction_scanned_.inc(scanned);
+    mem_eviction_lock_acquisitions_.inc(acquisitions);
+    mem_eviction_lock_wait_ms_.observe(wait_ms);
+    mem_eviction_lock_hold_ms_.observe(hold_ms);
+    mem_eviction_duration_ms_.observe(duration_ms);
+}
+void MasterMetricManager::set_mem_eviction_backoff_ms(int64_t delay_ms) {
+    mem_eviction_backoff_ms_.update(delay_ms);
+}
+
 // Eviction Metrics
 void MasterMetricManager::inc_eviction_success(int64_t key_count,
                                                int64_t size) {
@@ -1962,6 +2026,15 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_eviction_attempts_);
     serialize_metric(nof_evicted_key_count_);
     serialize_metric(nof_evicted_size_);
+
+    serialize_metric(pending_offload_bytes_);
+    serialize_metric(pending_offload_tasks_);
+    serialize_metric(mem_eviction_scanned_);
+    serialize_metric(mem_eviction_lock_acquisitions_);
+    serialize_metric(mem_eviction_lock_wait_ms_);
+    serialize_metric(mem_eviction_lock_hold_ms_);
+    serialize_metric(mem_eviction_duration_ms_);
+    serialize_metric(mem_eviction_backoff_ms_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);

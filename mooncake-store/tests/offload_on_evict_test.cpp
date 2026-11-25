@@ -153,6 +153,51 @@ TEST_F(OffloadOnEvictTest, ComboA_OffloadAtPutEnd) {
     service->RemoveAll();
 }
 
+TEST_F(OffloadOnEvictTest, PendingBytesFollowCompletionAndRemoval) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto initial_bytes = metrics.get_pending_offload_bytes();
+    const auto initial_tasks = metrics.get_pending_offload_tasks();
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.eviction_high_watermark_ratio = 1.0;
+    config.eviction_ratio = 0.0;
+    {
+        MasterService service(config);
+        auto ctx = PrepareSegment(service, "pending_node", kDefaultSegmentBase,
+                                  16 * 1024 * 1024);
+        ASSERT_TRUE(
+            service.MountLocalDiskSegment(ctx.client_id, true).has_value());
+        PutObject(service, ctx.client_id, "first", 1024);
+        PutObject(service, ctx.client_id, "second", 2048);
+        EXPECT_EQ(metrics.get_pending_offload_bytes(), initial_bytes + 3072);
+        EXPECT_EQ(metrics.get_pending_offload_tasks(), initial_tasks + 2);
+        // Dispatch is not completion: the source buffers remain pinned.
+        EXPECT_EQ(DrainOffloadQueue(service, ctx.client_id).size(), 2);
+        EXPECT_EQ(metrics.get_pending_offload_bytes(), initial_bytes + 3072);
+        StorageObjectMetadata disk;
+        disk.data_size = 1024;
+        disk.transport_endpoint = "pending_node";
+        OffloadTaskItem task{.tenant_id = TenantId::Default().value(),
+                             .key = "first",
+                             .size = 1024};
+        ASSERT_TRUE(service.NotifyOffloadSuccess(ctx.client_id, {task}, {disk})
+                        .has_value());
+        EXPECT_EQ(metrics.get_pending_offload_bytes(), initial_bytes + 2048);
+        EXPECT_EQ(metrics.get_pending_offload_tasks(), initial_tasks + 1);
+        // Duplicate notification cannot decrement the gauge twice.
+        ASSERT_TRUE(service.NotifyOffloadSuccess(ctx.client_id, {task}, {disk})
+                        .has_value());
+        EXPECT_EQ(metrics.get_pending_offload_bytes(), initial_bytes + 2048);
+        service.RemoveAll();
+        EXPECT_EQ(metrics.get_pending_offload_bytes(), initial_bytes);
+        EXPECT_EQ(metrics.get_pending_offload_tasks(), initial_tasks);
+        PutObject(service, ctx.client_id, "shutdown", 4096);
+        EXPECT_EQ(metrics.get_pending_offload_bytes(), initial_bytes + 4096);
+    }
+    EXPECT_EQ(metrics.get_pending_offload_bytes(), initial_bytes);
+    EXPECT_EQ(metrics.get_pending_offload_tasks(), initial_tasks);
+}
+
 TEST_F(OffloadOnEvictTest, ComboA_EvictionWorks) {
     // Regression: eviction still works in default mode
     const uint64_t kv_lease_ttl = 2000;

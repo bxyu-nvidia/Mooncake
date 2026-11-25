@@ -66,6 +66,19 @@ class MasterServiceSSDTest : public ::testing::Test {
         return {metadata.lease_timeout, metadata.memory_lease_timeout};
     }
 
+    size_t IndexedMemoryObjects(MasterService& service) {
+        size_t result = 0;
+        for (size_t i = 0; i < MasterService::kNumShards; ++i) {
+            MasterService::MetadataShardAccessorRO shard(&service, i);
+            result += shard->memory_candidates.size();
+        }
+        return result;
+    }
+
+    size_t EvictAndCountScans(MasterService& service) {
+        return service.BatchEvict(1.0, 1.0).scanned;
+    }
+
     void ExpectReplicaCounts(MasterService& service, const std::string& key,
                              size_t memory_count, size_t disk_count) {
         auto result = service.GetReplicaListForAdmin(key, TenantId::Default());
@@ -447,6 +460,51 @@ TEST_F(MasterServiceSSDTest, PartialEvictionReclaimsLookupLeasedMemory) {
                                 i < evicted_count ? 0 : 1, 1);
         }
     }
+}
+
+TEST_F(MasterServiceSSDTest, MemoryIndexExcludesOffloadedDiskOnlyObjects) {
+    MasterService service(ManualEvictionConfig());
+    const auto client = generate_uuid();
+    MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+    for (int i = 0; i < 100; ++i) {
+        const auto key = "disk_" + std::to_string(i);
+        PutAndOffload(service, client, key, 128, "node");
+        SetLeaseDeadlines(service, key, Clock::now() - std::chrono::seconds(1),
+                          Clock::now() - std::chrono::seconds(1));
+    }
+    EXPECT_EQ(IndexedMemoryObjects(service), 100);
+    EXPECT_EQ(EvictAndCountScans(service), 100);
+    EXPECT_EQ(IndexedMemoryObjects(service), 0);
+    // No repeated scan of retained disk metadata, even under pressure.
+    EXPECT_EQ(EvictAndCountScans(service), 0);
+    for (int i = 0; i < 100; ++i) {
+        ExpectReplicaCounts(service, "disk_" + std::to_string(i), 0, 1);
+    }
+    PutAndOffload(service, client, "fresh", 128, "node");
+    EXPECT_EQ(IndexedMemoryObjects(service), 1);
+    service.RemoveAll();
+    EXPECT_EQ(IndexedMemoryObjects(service), 0);
+}
+
+TEST_F(MasterServiceSSDTest, EvictionPassBoundsWorkAndEventuallyReclaimsAll) {
+    MasterService service(ManualEvictionConfig());
+    const auto client = generate_uuid();
+    MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+    const size_t count = kMemoryEvictionScanLimit + 100;
+    for (size_t i = 0; i < count; ++i) {
+        const auto key = "bounded_" + std::to_string(i);
+        PutAndOffload(service, client, key, 128, "node");
+        SetLeaseDeadlines(service, key, Clock::now() - std::chrono::seconds(1),
+                          Clock::now() - std::chrono::seconds(1));
+    }
+    const size_t scanned = EvictAndCountScans(service);
+    EXPECT_LE(scanned, kMemoryEvictionScanLimit);
+    EXPECT_GT(IndexedMemoryObjects(service), 0);
+    for (int i = 0; i < 4 && IndexedMemoryObjects(service) > 0; ++i) {
+        EXPECT_LE(EvictAndCountScans(service), kMemoryEvictionScanLimit);
+    }
+    EXPECT_EQ(IndexedMemoryObjects(service), 0);
+    ExpectReplicaCounts(service, "bounded_0", 0, 1);
 }
 
 TEST_F(MasterServiceSSDTest, PutEndBothReplica) {

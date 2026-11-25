@@ -284,6 +284,15 @@ class MasterMetricManager {
     void inc_nof_eviction_success(int64_t key_count, int64_t size);
     void inc_nof_eviction_fail();  // not a single object is evicted
 
+    // Bytes pinned by admitted offloads, including queued and executing tasks.
+    void add_pending_offload(int64_t tasks, int64_t bytes);
+    int64_t get_pending_offload_bytes();
+    int64_t get_pending_offload_tasks();
+    void observe_mem_eviction_pass(uint64_t scanned, uint64_t acquisitions,
+                                   double wait_ms, double hold_ms,
+                                   double duration_ms);
+    void set_mem_eviction_backoff_ms(int64_t delay_ms);
+
     // Eviction Metrics Getters
     // total eviction metrics
     int64_t get_eviction_success();
@@ -695,6 +704,15 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+
+    ylt::metric::gauge_t pending_offload_bytes_;
+    ylt::metric::gauge_t pending_offload_tasks_;
+    ylt::metric::counter_t mem_eviction_scanned_;
+    ylt::metric::counter_t mem_eviction_lock_acquisitions_;
+    ylt::metric::histogram_t mem_eviction_lock_wait_ms_;
+    ylt::metric::histogram_t mem_eviction_lock_hold_ms_;
+    ylt::metric::histogram_t mem_eviction_duration_ms_;
+    ylt::metric::gauge_t mem_eviction_backoff_ms_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;
