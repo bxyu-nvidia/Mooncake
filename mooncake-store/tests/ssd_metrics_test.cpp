@@ -253,3 +253,66 @@ TEST_F(SsdMetricsTest, LatencyBucketBoundaryTest) {
 }
 
 }  // namespace mooncake::test
+
+TEST(OffloadDiagnosticsTest, TimersExportOnlyCountersAndGauges) {
+    mooncake::OffloadMetrics metrics;
+    {
+        mooncake::OffloadTimer timer(
+            &metrics, mooncake::OffloadMetrics::Phase::offload_write);
+        timer.Stop();
+        timer.Stop();
+    }
+    std::string output;
+    metrics.Serialize(output);
+    EXPECT_EQ(output.find(" histogram\n"), std::string::npos);
+    EXPECT_EQ(output.find(" summary\n"), std::string::npos);
+    EXPECT_NE(output.find("mooncake_offload_write_operations_total 1.000000"),
+              std::string::npos);
+}
+
+TEST(OffloadDiagnosticsTest, WatermarkDelayIsRecordedOncePerCrossing) {
+    mooncake::OffloadMetrics metrics;
+    metrics.Usage(95, 100, 0.9, 0.8);
+    EXPECT_GT(metrics.pending_trigger_since_us.load(), 0);
+    metrics.pending_trigger_since_us.exchange(0);  // first pass began
+    metrics.Usage(94, 100, 0.9, 0.8);
+    EXPECT_EQ(metrics.pending_trigger_since_us.load(), 0);
+    EXPECT_EQ(
+        metrics.Get(mooncake::OffloadMetrics::Gauge::disk_above_low_bytes), 14);
+    metrics.Usage(89, 100, 0.9, 0.8);
+    EXPECT_EQ(metrics.above_high_since_us.load(), 0);
+    metrics.Usage(95, 100, 0.9, 0.8);
+    EXPECT_GT(metrics.pending_trigger_since_us.load(), 0);
+}
+
+TEST(OffloadDiagnosticsTest, SourceReferencesTrackDispatchAndCancellation) {
+    mooncake::OffloadSourceMetrics metrics;
+    const auto start = mooncake::OffloadMetrics::NowUs() - 2000000;
+    // Equal timestamps are valid, including different object sizes.
+    metrics.Admit(start, 100);
+    metrics.Admit(start, 200);
+    metrics.Dispatch(start, 100);
+    std::string output;
+    metrics.Serialize(output);
+    EXPECT_NE(output.find("master_offload_diagnostics_queued_bytes 200.000000"),
+              std::string::npos);
+    EXPECT_NE(
+        output.find("master_offload_diagnostics_dispatched_bytes 100.000000"),
+        std::string::npos);
+    metrics.Release(start, 100, true);
+    metrics.Release(start, 200, false);
+    output.clear();
+    metrics.Serialize(output);
+    EXPECT_NE(output.find("master_offload_diagnostics_queued_bytes 0.000000"),
+              std::string::npos);
+    EXPECT_NE(
+        output.find("master_offload_diagnostics_dispatched_bytes 0.000000"),
+        std::string::npos);
+    EXPECT_NE(
+        output.find(
+            "master_offload_diagnostics_queued_oldest_age_seconds 0.000000"),
+        std::string::npos);
+    EXPECT_NE(output.find("master_offload_diagnostics_source_reference_"
+                          "operations_total 2.000000"),
+              std::string::npos);
+}

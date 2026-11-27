@@ -1,4 +1,7 @@
 #pragma once
+#include "offload_metrics.h"
+#include "bucket_disk_usage.h"
+#include "disk_watermark_eviction.h"
 
 #include <glog/logging.h>
 
@@ -21,6 +24,10 @@
 #include "types.h"
 
 namespace mooncake {
+namespace test {
+class StorageBackendTest;
+}
+
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -214,9 +221,9 @@ struct BucketBackendConfig {
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
 
-    // Hard cap on *actual on-disk* bytes of the offload directory, measured by
-    // scanning real file allocation (stat st_blocks), NOT the in-memory
-    // total_size_. 0 = disabled.
+    // Hard cap on *actual on-disk* bytes of the offload directory. Track real
+    // file allocation (stat st_blocks), reconcile periodically, and reserve
+    // in-flight writes. Independent of logical total_size_. 0 = disabled.
     //
     // Why a separate, disk-measured cap: total_size_ is decremented per object
     // on eviction/delete, but a 256 MB bucket file is only removed once *all*
@@ -225,17 +232,14 @@ struct BucketBackendConfig {
     // (cf. unreliable bucket GC, kvcache-ai/Mooncake#3220/#3221). The other
     // physical guard, std::filesystem::space(), reports the *host* filesystem
     // under a cgroup / K8s emptyDir sizeLimit rather than the enforced quota,
-    // so it never fires either. This cap scans the actual directory (the same
-    // st_blocks basis kubelet's emptyDir accounting uses), so it matches what
-    // actually triggers pod eviction. Set it to the real quota minus headroom.
+    // so it never fires either. Accounting uses the same st_blocks basis as
+    // kubelet's emptyDir accounting. Set it to the real quota minus headroom.
     int64_t max_physical_bytes = 0;
 
-    // How long ActualDiskBytesUsedLocked() caches its directory-scan result
-    // (milliseconds). Bounds scan cost under a high offload rate; larger =
-    // cheaper but a staler physical bound (disk may momentarily exceed the cap
-    // by roughly one interval's worth of writes), smaller = tighter but scans
-    // more often. <=0 disables caching (scan every check). Only relevant when
-    // max_physical_bytes > 0.
+    // Interval between reconciliation scans of actual allocated file blocks.
+    // Known writes/deletions update accounting immediately without invalidating
+    // the scan cache. External changes/orphans are discovered at this interval.
+    // <=0 scans on every capacity check. Only used with max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
 
     bool Validate() const;
@@ -440,6 +444,14 @@ class StorageBackendInterface {
         return std::vector<std::string>{};
     }
 
+    // nullopt means no unfinished watermark cycle. Otherwise the heartbeat
+    // thread can continue bounded passes without another master heartbeat.
+    virtual std::optional<std::chrono::milliseconds>
+    DiskWatermarkEvictionRetryDelay() const {
+        return std::nullopt;
+    }
+
+    std::shared_ptr<OffloadMetrics> offload_metrics_;
     FileStorageConfig file_storage_config_;
 };
 
@@ -1026,7 +1038,12 @@ class BucketStorageBackend : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    std::optional<std::chrono::milliseconds> DiskWatermarkEvictionRetryDelay()
+        const override;
+
    private:
+    friend class test::StorageBackendTest;
+
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1097,6 +1114,8 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::string> write_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
+        int64_t physical_write_size = 0;
+        bool readers_blocked = false;
     };
 
     /**
@@ -1108,7 +1127,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return PendingEviction with all keys and bucket metadata removed.
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
-        int64_t required_size, const std::vector<std::string>& write_keys = {});
+        int64_t required_size, const std::vector<std::string>& write_keys = {},
+        int64_t physical_write_size = 0, bool avoid_readers = false);
 
     void RestorePreparedEviction(PendingEviction&& pending);
 
@@ -1129,23 +1149,12 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
     SelectEvictionCandidate();
 
-    /**
-     * @brief Actual on-disk bytes of the offload directory, measured by
-     *        summing real file allocation (stat st_blocks * 512) over every
-     *        file under storage_path_.
-     *
-     * This is ground truth — the same block-based accounting kubelet uses for
-     * emptyDir sizeLimit — so it captures bucket files that linger after their
-     * objects are logically evicted (which the in-memory total_size_ misses).
-     * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
-     * the scan cost regardless of offload rate. Caller must hold mutex_.
-     */
-    int64_t ActualDiskBytesUsedLocked() const;
+    void RefreshBucketDiskUsage(int64_t bucket_id);
+    bool RemoveBucketFile(const std::string& path, std::error_code& error);
 
-    // Cached result of ActualDiskBytesUsedLocked() and when it was taken.
-    mutable int64_t cached_disk_bytes_ GUARDED_BY(mutex_) = -1;
-    mutable std::chrono::steady_clock::time_point cached_disk_bytes_at_
-        GUARDED_BY(mutex_);
+    BucketDiskUsage disk_usage_;
+    int64_t physical_block_size_ = 4096;
+    int64_t pending_physical_write_size_ GUARDED_BY(mutex_) = 0;
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
@@ -1208,6 +1217,14 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable SharedMutex mutex_;
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
+    void ObserveDiskUsageLocked() {
+        if (offload_metrics_)
+            offload_metrics_->Usage(
+                total_size_, bucket_backend_config_.max_total_size,
+                file_storage_config_.disk_eviction_high_watermark_ratio,
+                file_storage_config_.disk_eviction_low_watermark_ratio);
+    }
+    DiskWatermarkEviction disk_watermark_eviction_ GUARDED_BY(mutex_);
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;

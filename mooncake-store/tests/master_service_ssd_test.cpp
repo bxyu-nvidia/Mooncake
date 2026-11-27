@@ -3,10 +3,13 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "master_metric_manager.h"
@@ -28,6 +31,67 @@ class MasterServiceSSDTest : public ::testing::Test {
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    using Clock = std::chrono::system_clock;
+
+    static MasterServiceConfig ManualEvictionConfig() {
+        MasterServiceConfig config;
+        config.enable_offload = true;
+        config.default_kv_lease_ttl = 30000;
+        // Drive eviction explicitly, including after an allocation failure.
+        config.eviction_high_watermark_ratio = 1.0;
+        config.eviction_ratio = 0.0;
+        return config;
+    }
+
+    void SetLeaseDeadlines(MasterService& service, const std::string& key,
+                           Clock::time_point object_deadline,
+                           Clock::time_point memory_deadline) {
+        const auto tenant = TenantId::Default();
+        MasterService::MetadataShardAccessorRW shard(
+            &service, service.getMetadataShardIndex(tenant, key));
+        auto& metadata = shard->tenants.at(tenant).metadata.at(key);
+        SpinLocker locker(&metadata.lock);
+        metadata.lease_timeout = object_deadline;
+        metadata.memory_lease_timeout = memory_deadline;
+    }
+
+    std::pair<Clock::time_point, Clock::time_point> GetLeaseDeadlines(
+        MasterService& service, const std::string& key) {
+        const auto tenant = TenantId::Default();
+        MasterService::MetadataShardAccessorRO shard(
+            &service, service.getMetadataShardIndex(tenant, key));
+        const auto& metadata = shard->tenants.at(tenant).metadata.at(key);
+        SpinLocker locker(&metadata.lock);
+        return {metadata.lease_timeout, metadata.memory_lease_timeout};
+    }
+
+    size_t IndexedMemoryObjects(MasterService& service) {
+        size_t result = 0;
+        for (size_t i = 0; i < MasterService::kNumShards; ++i) {
+            MasterService::MetadataShardAccessorRO shard(&service, i);
+            result += shard->memory_candidates.size();
+        }
+        return result;
+    }
+
+    size_t EvictAndCountScans(MasterService& service) {
+        return service.BatchEvict(1.0, 1.0).scanned;
+    }
+
+    void ExpectReplicaCounts(MasterService& service, const std::string& key,
+                             size_t memory_count, size_t disk_count) {
+        auto result = service.GetReplicaListForAdmin(key, TenantId::Default());
+        ASSERT_TRUE(result.has_value());
+        size_t memory = 0;
+        size_t disk = 0;
+        for (const auto& replica : result->replicas) {
+            memory += replica.is_memory_replica();
+            disk += replica.is_local_disk_replica();
+        }
+        EXPECT_EQ(memory, memory_count) << key;
+        EXPECT_EQ(disk, disk_count) << key;
+    }
 };
 
 std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
@@ -56,9 +120,13 @@ void MountMemoryAndLocalDisk(MasterService& service, const UUID& client_id,
 
 void PutAndOffload(MasterService& service, const UUID& client_id,
                    const std::string& key, int64_t object_size,
-                   const std::string& local_disk_endpoint) {
+                   const std::string& local_disk_endpoint,
+                   const std::string& group_id = "") {
     ReplicateConfig config;
     config.replica_num = 1;
+    if (!group_id.empty()) {
+        config.group_ids = std::vector<std::string>{group_id};
+    }
 
     ASSERT_TRUE(
         service
@@ -93,6 +161,350 @@ void ExpectNextAllocationOnSegment(MasterService& service,
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               expected_segment);
+}
+
+// Existence checks must preserve availability without pinning SSD-backed RAM.
+TEST_F(MasterServiceSSDTest, ExistenceLeaseAllowsOffloadedMemoryEviction) {
+    for (bool batch : {false, true}) {
+        MasterServiceConfig config;
+        config.enable_offload = true;
+        config.default_kv_lease_ttl = 30000;
+        MasterService service(config);
+        const auto client = generate_uuid();
+        MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+        PutAndOffload(service, client, "cached", 128, "node");
+        if (batch) {
+            auto exists =
+                service.BatchExistKey({"cached"}, TenantId::Default());
+            ASSERT_EQ(exists.size(), 1);
+            ASSERT_TRUE(exists[0].value_or(false));
+        } else {
+            ASSERT_TRUE(service.ExistKey("cached", TenantId::Default())
+                            .value_or(false));
+        }
+
+        service.RunBatchEvictForTesting(1.0, 1.0);
+        auto replicas =
+            service.GetReplicaListForAdmin("cached", TenantId::Default());
+        ASSERT_TRUE(replicas.has_value());
+        ASSERT_EQ(replicas->replicas.size(), 1);
+        EXPECT_TRUE(replicas->replicas[0].is_local_disk_replica());
+        auto remove = service.Remove("cached", TenantId::Default());
+        ASSERT_FALSE(remove.has_value());
+        EXPECT_EQ(remove.error(), ErrorCode::OBJECT_HAS_LEASE);
+    }
+}
+
+TEST_F(MasterServiceSSDTest, ExistenceLeaseProtectsMemoryWithoutDiskCopy) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 30000;
+    MasterService service(config);
+    const auto client = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "node";
+    segment.base = 0x300000000;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+    ASSERT_TRUE(service.MountSegment(segment, client).has_value());
+    ASSERT_TRUE(service
+                    .PutStart(client, "cached", TenantId::Default(), 128,
+                              {.replica_num = 1})
+                    .has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(client, "cached", TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    ASSERT_TRUE(
+        service.ExistKey("cached", TenantId::Default()).value_or(false));
+
+    service.RunBatchEvictForTesting(1.0, 1.0);
+    auto replicas =
+        service.GetReplicaListForAdmin("cached", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_TRUE(replicas->replicas[0].is_memory_replica());
+}
+
+TEST_F(MasterServiceSSDTest,
+       DescriptorLeaseProtectsOffloadedMemoryAfterLookup) {
+    for (bool batch : {false, true}) {
+        MasterServiceConfig config;
+        config.enable_offload = true;
+        config.default_kv_lease_ttl = 30000;
+        MasterService service(config);
+        const auto client = generate_uuid();
+        MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+        PutAndOffload(service, client, "cached", 128, "node");
+        ASSERT_TRUE(
+            service.ExistKey("cached", TenantId::Default()).value_or(false));
+        if (batch) {
+            auto replicas =
+                service.BatchGetReplicaList({"cached"}, TenantId::Default());
+            ASSERT_EQ(replicas.size(), 1);
+            ASSERT_TRUE(replicas[0].has_value());
+        } else {
+            ASSERT_TRUE(service.GetReplicaList("cached", TenantId::Default())
+                            .has_value());
+        }
+
+        service.RunBatchEvictForTesting(1.0, 1.0);
+        auto replicas =
+            service.GetReplicaListForAdmin("cached", TenantId::Default());
+        ASSERT_TRUE(replicas.has_value());
+        ASSERT_EQ(replicas->replicas.size(), 2);
+    }
+}
+
+TEST_F(MasterServiceSSDTest, GroupedDescriptorLeaseAfterLookupProtectsPeers) {
+    for (bool read : {false, true}) {
+        MasterServiceConfig config;
+        config.enable_offload = true;
+        config.default_kv_lease_ttl = 30000;
+        MasterService service(config);
+        const auto client = generate_uuid();
+        MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+        for (const auto& key : {"cached", "peer"}) {
+            PutAndOffload(service, client, key, 128, "node", "group");
+        }
+        ASSERT_TRUE(
+            service.ExistKey("cached", TenantId::Default()).value_or(false));
+        if (read) {
+            ASSERT_TRUE(service.GetReplicaList("cached", TenantId::Default())
+                            .has_value());
+            ASSERT_TRUE(service.ExistKey("cached", TenantId::Default())
+                            .value_or(false));
+        }
+
+        service.RunBatchEvictForTesting(1.0, 1.0);
+        for (const auto& key : {"cached", "peer"}) {
+            auto replicas =
+                service.GetReplicaListForAdmin(key, TenantId::Default());
+            ASSERT_TRUE(replicas.has_value());
+            EXPECT_EQ(replicas->replicas.size(), read ? 2 : 1);
+            if (!read) {
+                EXPECT_TRUE(replicas->replicas[0].is_local_disk_replica());
+            }
+        }
+    }
+}
+
+TEST_F(MasterServiceSSDTest,
+       AllocationRecoversAfterEvictingLookupLeasedMemory) {
+    MasterService service(ManualEvictionConfig());
+    const auto client = generate_uuid();
+    MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+    constexpr int64_t cached_size = 40 * 1024 * 1024;
+    constexpr int64_t incoming_size = 32 * 1024 * 1024;
+    ASSERT_TRUE(service
+                    .PutStart(client, "cached", TenantId::Default(),
+                              cached_size, {.replica_num = 1})
+                    .has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(client, "cached", TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+
+    // BatchPutStart delegates each key to this allocation path. The 64 MiB
+    // segment cannot fit the new object alongside the existing 40 MiB one.
+    auto blocked = service.PutStart(client, "incoming", TenantId::Default(),
+                                    incoming_size, {.replica_num = 1});
+    ASSERT_FALSE(blocked.has_value());
+    ASSERT_EQ(blocked.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Even expired leases must not allow reclaiming an in-flight offload.
+    const auto expired = Clock::now() - std::chrono::seconds(1);
+    SetLeaseDeadlines(service, "cached", expired, expired);
+    service.RunBatchEvictForTesting(1.0, 1.0);
+    ExpectReplicaCounts(service, "cached", 1, 0);
+
+    StorageObjectMetadata disk_metadata;
+    disk_metadata.data_size = cached_size;
+    disk_metadata.transport_endpoint = "node";
+    OffloadTaskItem task{.tenant_id = TenantId::Default().value(),
+                         .key = "cached",
+                         .size = cached_size};
+    ASSERT_TRUE(service.NotifyOffloadSuccess(client, {task}, {disk_metadata})
+                    .has_value());
+    for (int i = 0; i < 5; ++i) {
+        auto exists = service.BatchExistKey({"cached"}, TenantId::Default());
+        ASSERT_EQ(exists.size(), 1);
+        ASSERT_TRUE(exists[0].value_or(false));
+    }
+
+    service.RunBatchEvictForTesting(1.0, 1.0);
+    ExpectReplicaCounts(service, "cached", 0, 1);
+    auto recovered = service.PutStart(client, "incoming", TenantId::Default(),
+                                      incoming_size, {.replica_num = 1});
+    ASSERT_TRUE(recovered.has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(client, "incoming", TenantId::Default(),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_TRUE(
+        service.ExistKey("cached", TenantId::Default()).value_or(false));
+    ExpectReplicaCounts(service, "incoming", 1, 0);
+}
+
+TEST_F(MasterServiceSSDTest, RepeatedLookupsDoNotRenewExpiredMemoryLease) {
+    for (bool batch : {false, true}) {
+        SCOPED_TRACE(batch);
+        MasterService service(ManualEvictionConfig());
+        const auto client = generate_uuid();
+        MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+        PutAndOffload(service, client, "cached", 128, "node");
+        ASSERT_TRUE(
+            service.GetReplicaList("cached", TenantId::Default()).has_value());
+        service.RunBatchEvictForTesting(1.0, 1.0);
+        ExpectReplicaCounts(service, "cached", 1, 1);
+
+        // Age out the reader's lease without depending on sleeps or scheduler
+        // timing. Repeated lookups should retain only object availability.
+        const auto expired = Clock::now() - std::chrono::seconds(1);
+        SetLeaseDeadlines(service, "cached", expired, expired);
+        for (int i = 0; i < 5; ++i) {
+            if (batch) {
+                auto exists =
+                    service.BatchExistKey({"cached"}, TenantId::Default());
+                ASSERT_EQ(exists.size(), 1);
+                ASSERT_TRUE(exists[0].value_or(false));
+            } else {
+                ASSERT_TRUE(service.ExistKey("cached", TenantId::Default())
+                                .value_or(false));
+            }
+        }
+        const auto [object_deadline, memory_deadline] =
+            GetLeaseDeadlines(service, "cached");
+        EXPECT_GT(object_deadline, Clock::now());
+        EXPECT_EQ(memory_deadline, expired);
+        service.RunBatchEvictForTesting(1.0, 1.0);
+        ExpectReplicaCounts(service, "cached", 0, 1);
+    }
+}
+
+TEST_F(MasterServiceSSDTest, RepeatedDescriptorQueriesRenewAdvertisedLease) {
+    for (bool grouped : {false, true}) {
+        for (bool batch : {false, true}) {
+            SCOPED_TRACE(grouped);
+            SCOPED_TRACE(batch);
+            const auto config = ManualEvictionConfig();
+            MasterService service(config);
+            const auto client = generate_uuid();
+            MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+            for (const auto& key : {"cached", "peer"}) {
+                PutAndOffload(service, client, key, 128, "node",
+                              grouped ? "group" : "");
+            }
+            ASSERT_TRUE(service.GetReplicaList("cached", TenantId::Default())
+                            .has_value());
+            // A 30s lease with 20s left triggers the half-TTL shortcut. A new
+            // descriptor response must nevertheless protect the full 30s.
+            const auto old_deadline = Clock::now() + std::chrono::seconds(20);
+            for (const auto& key : {"cached", "peer"}) {
+                SetLeaseDeadlines(service, key, old_deadline, old_deadline);
+            }
+            const auto before_query = Clock::now();
+            uint64_t advertised_ttl;
+            if (batch) {
+                auto result = service.BatchGetReplicaList({"cached"},
+                                                          TenantId::Default());
+                ASSERT_EQ(result.size(), 1);
+                ASSERT_TRUE(result[0].has_value());
+                advertised_ttl = result[0]->lease_ttl_ms;
+            } else {
+                auto result =
+                    service.GetReplicaList("cached", TenantId::Default());
+                ASSERT_TRUE(result.has_value());
+                advertised_ttl = result->lease_ttl_ms;
+            }
+            ASSERT_EQ(advertised_ttl, config.default_kv_lease_ttl);
+            const auto expected_deadline =
+                before_query + std::chrono::milliseconds(advertised_ttl);
+            EXPECT_GE(GetLeaseDeadlines(service, "cached").second,
+                      expected_deadline);
+            if (grouped) {
+                EXPECT_GE(GetLeaseDeadlines(service, "peer").second,
+                          expected_deadline);
+            } else {
+                EXPECT_EQ(GetLeaseDeadlines(service, "peer").second,
+                          old_deadline);
+            }
+            service.RunBatchEvictForTesting(1.0, 1.0);
+            ExpectReplicaCounts(service, "cached", 1, 1);
+            ExpectReplicaCounts(service, "peer", 1, 1);
+        }
+    }
+}
+
+TEST_F(MasterServiceSSDTest, PartialEvictionReclaimsLookupLeasedMemory) {
+    for (double ratio : {0.1, 0.2}) {
+        SCOPED_TRACE(ratio);
+        MasterService service(ManualEvictionConfig());
+        const auto client = generate_uuid();
+        MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+        constexpr int object_count = 20;
+        const auto now = Clock::now();
+        for (int i = 0; i < object_count; ++i) {
+            const auto key = "cached_" + std::to_string(i);
+            PutAndOffload(service, client, key, 128, "node");
+            ASSERT_TRUE(
+                service.ExistKey(key, TenantId::Default()).value_or(false));
+            // Distinct lookup deadlines give a deterministic eviction order.
+            SetLeaseDeadlines(service, key, now + std::chrono::seconds(30 + i),
+                              now - std::chrono::seconds(1));
+        }
+        service.RunBatchEvictForTesting(ratio, ratio / 2);
+        const int evicted_count = ratio == 0.1 ? 2 : 4;
+        for (int i = 0; i < object_count; ++i) {
+            ExpectReplicaCounts(service, "cached_" + std::to_string(i),
+                                i < evicted_count ? 0 : 1, 1);
+        }
+    }
+}
+
+TEST_F(MasterServiceSSDTest, MemoryIndexExcludesOffloadedDiskOnlyObjects) {
+    MasterService service(ManualEvictionConfig());
+    const auto client = generate_uuid();
+    MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+    for (int i = 0; i < 100; ++i) {
+        const auto key = "disk_" + std::to_string(i);
+        PutAndOffload(service, client, key, 128, "node");
+        SetLeaseDeadlines(service, key, Clock::now() - std::chrono::seconds(1),
+                          Clock::now() - std::chrono::seconds(1));
+    }
+    EXPECT_EQ(IndexedMemoryObjects(service), 100);
+    EXPECT_EQ(EvictAndCountScans(service), 100);
+    EXPECT_EQ(IndexedMemoryObjects(service), 0);
+    // No repeated scan of retained disk metadata, even under pressure.
+    EXPECT_EQ(EvictAndCountScans(service), 0);
+    for (int i = 0; i < 100; ++i) {
+        ExpectReplicaCounts(service, "disk_" + std::to_string(i), 0, 1);
+    }
+    PutAndOffload(service, client, "fresh", 128, "node");
+    EXPECT_EQ(IndexedMemoryObjects(service), 1);
+    service.RemoveAll();
+    EXPECT_EQ(IndexedMemoryObjects(service), 0);
+}
+
+TEST_F(MasterServiceSSDTest, EvictionPassBoundsWorkAndEventuallyReclaimsAll) {
+    MasterService service(ManualEvictionConfig());
+    const auto client = generate_uuid();
+    MountMemoryAndLocalDisk(service, client, "node", 0x300000000);
+    const size_t count = kMemoryEvictionScanLimit + 100;
+    for (size_t i = 0; i < count; ++i) {
+        const auto key = "bounded_" + std::to_string(i);
+        PutAndOffload(service, client, key, 128, "node");
+        SetLeaseDeadlines(service, key, Clock::now() - std::chrono::seconds(1),
+                          Clock::now() - std::chrono::seconds(1));
+    }
+    const size_t scanned = EvictAndCountScans(service);
+    EXPECT_LE(scanned, kMemoryEvictionScanLimit);
+    EXPECT_GT(IndexedMemoryObjects(service), 0);
+    for (int i = 0; i < 4 && IndexedMemoryObjects(service) > 0; ++i) {
+        EXPECT_LE(EvictAndCountScans(service), kMemoryEvictionScanLimit);
+    }
+    EXPECT_EQ(IndexedMemoryObjects(service), 0);
+    ExpectReplicaCounts(service, "bounded_0", 0, 1);
 }
 
 TEST_F(MasterServiceSSDTest, PutEndBothReplica) {

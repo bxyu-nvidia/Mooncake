@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -98,6 +99,21 @@ void ExpectDefaultOffsetAllocatorConfig(
 class StorageBackendTest : public ::testing::Test {
    protected:
     std::string data_path;
+
+    static std::unique_ptr<BucketReadGuard> PinBucket(
+        BucketStorageBackend& backend, const std::string& key) {
+        SharedMutexLocker lock(&backend.mutex_, shared_lock);
+        const auto id = backend.object_bucket_map_.at(key).bucket_id;
+        return std::make_unique<BucketReadGuard>(backend.buckets_.at(id));
+    }
+
+    static std::string BucketPath(BucketStorageBackend& backend,
+                                  const std::string& key) {
+        SharedMutexLocker lock(&backend.mutex_, shared_lock);
+        return backend
+            .GetBucketDataPath(backend.object_bucket_map_.at(key).bucket_id)
+            .value();
+    }
 
     // Helper function to test partial success behavior for any
     // StorageBackendInterface. Uses deterministic failure injection on a batch
@@ -3288,6 +3304,238 @@ TEST_F(StorageBackendTest,
     EXPECT_EQ(notified_keys, expected_keys);
 }
 
+// Read the exported values to cover the names consumed by metrics scrapers.
+static int64_t WriteMetric(const OffloadMetrics& metrics,
+                           const std::string& suffix) {
+    std::string output;
+    metrics.Serialize(output);
+    const auto name = "\nmooncake_offload_write_" + suffix + " ";
+    const auto pos = output.find(name);
+    EXPECT_NE(pos, std::string::npos) << name;
+    return pos == std::string::npos
+               ? -1
+               : std::stoll(output.substr(pos + name.size()));
+}
+
+TEST_F(StorageBackendTest, BucketWritePhaseMetricsPreserveDataAndExcludeReads) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_physical_bytes = 1024 * 1024;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    std::string key = "timed_key";
+    std::string value(8192, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {key, {{value.data(), value.size()}}}};
+    auto result = backend.BatchOffload(batch, nullptr);
+    ASSERT_TRUE(result);
+    const auto& metrics = *backend.offload_metrics_;
+    EXPECT_EQ(WriteMetric(metrics, "operations_total"), 1);
+    EXPECT_EQ(WriteMetric(metrics, "open_operations_total"), 2);
+    EXPECT_EQ(WriteMetric(metrics, "close_operations_total"), 2);
+    int64_t component_us = 0;
+    for (const auto* phase : {"pwritev", "metadata", "accounting"}) {
+        EXPECT_EQ(
+            WriteMetric(metrics, std::string(phase) + "_operations_total"), 1);
+        component_us +=
+            WriteMetric(metrics, std::string(phase) + "_duration_us_total");
+    }
+    for (const auto* phase : {"open", "close"}) {
+        component_us +=
+            WriteMetric(metrics, std::string(phase) + "_duration_us_total");
+    }
+    EXPECT_GE(WriteMetric(metrics, "duration_us_total"), component_us);
+    EXPECT_EQ(WriteMetric(metrics, "pwritev_bytes_total"),
+              key.size() + value.size());
+    EXPECT_EQ(WriteMetric(metrics, "metadata_bytes_total"),
+              fs::file_size(fs::path(data_path) /
+                            (std::to_string(*result) + ".meta")));
+
+    std::string before_read;
+    metrics.Serialize(before_read);
+    std::string loaded(value.size(), '\0');
+    std::unordered_map<std::string, Slice> slices{
+        {key, {loaded.data(), loaded.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(slices));
+    EXPECT_EQ(loaded, value);
+    std::string after_read;
+    metrics.Serialize(after_read);
+    EXPECT_EQ(before_read, after_read);
+    EXPECT_EQ(after_read.find(" histogram\n"), std::string::npos);
+    EXPECT_EQ(after_read.find(" summary\n"), std::string::npos);
+}
+
+TEST_F(StorageBackendTest, BucketWritePhaseMetricsIncludeFailedFileOpens) {
+    for (const auto* extension : {".bucket", ".meta"}) {
+        SCOPED_TRACE(extension);
+        FileStorageConfig config;
+        config.storage_filepath = (fs::path(data_path) / extension).string();
+        fs::create_directories(config.storage_filepath);
+        BucketBackendConfig buckets;
+        buckets.max_physical_bytes = 1024 * 1024;
+        BucketStorageBackend backend(config, buckets);
+        ASSERT_TRUE(backend.Init());
+        std::string value(8192, 'x');
+        std::unordered_map<std::string, std::vector<Slice>> seed{
+            {"seed", {{value.data(), value.size()}}}};
+        auto first = backend.BatchOffload(seed, nullptr);
+        ASSERT_TRUE(first);
+        // A directory makes opening the next data/metadata file fail, even
+        // when the test runs as root. No storage or clock mocks are needed.
+        fs::create_directory(fs::path(config.storage_filepath) /
+                             (std::to_string(*first + 1) + extension));
+        backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"failed", {{value.data(), value.size()}}}};
+        EXPECT_FALSE(backend.BatchOffload(batch, nullptr));
+        EXPECT_FALSE(backend.IsExist("failed").value());
+        const auto& metrics = *backend.offload_metrics_;
+        const bool data_written = std::string_view(extension) == ".meta";
+        EXPECT_EQ(WriteMetric(metrics, "operations_total"), 1);
+        EXPECT_EQ(WriteMetric(metrics, "open_operations_total"),
+                  data_written ? 2 : 1);
+        EXPECT_EQ(WriteMetric(metrics, "close_operations_total"),
+                  data_written ? 1 : 0);
+        EXPECT_EQ(WriteMetric(metrics, "pwritev_operations_total"),
+                  data_written ? 1 : 0);
+        EXPECT_EQ(WriteMetric(metrics, "pwritev_bytes_total"),
+                  data_written ? value.size() + 6 : 0);
+        EXPECT_EQ(WriteMetric(metrics, "metadata_operations_total"), 0);
+        EXPECT_EQ(WriteMetric(metrics, "metadata_bytes_total"), 0);
+        EXPECT_EQ(WriteMetric(metrics, "accounting_operations_total"), 1);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalAccountingSurvivesReactiveEviction) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 1024 * 1024;
+    buckets.max_physical_bytes = 32 * 1024;
+    buckets.disk_scan_cache_ms = 3600000;
+    buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    std::string value(8192, 'x');
+    for (int i = 0; i < 20; ++i) {
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"physical_" + std::to_string(i), {{value.data(), value.size()}}}};
+        ASSERT_TRUE(backend.BatchOffload(batch, nullptr));
+        int64_t allocated = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(data_path)) {
+            struct stat st{};
+            ASSERT_EQ(::stat(entry.path().c_str(), &st), 0);
+            allocated += st.st_blocks * 512;
+        }
+        EXPECT_LE(allocated, buckets.max_physical_bytes);
+    }
+    EXPECT_FALSE(backend.IsExist("physical_0").value());
+    EXPECT_TRUE(backend.IsExist("physical_19").value());
+    std::string metrics;
+    backend.offload_metrics_->Serialize(metrics);
+    EXPECT_NE(
+        metrics.find("mooncake_offload_disk_scan_operations_total 1.000000\n"),
+        std::string::npos);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalCapReservesRoundedDataAndMetadata) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 1024 * 1024;
+    buckets.max_physical_bytes = 8192;
+    buckets.disk_scan_cache_ms = 3600000;
+    buckets.eviction_policy = BucketEvictionPolicy::NONE;
+    BucketStorageBackend backend(config, buckets);
+    ASSERT_TRUE(backend.Init());
+    std::string value(8192, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> large{
+        {"large", {{value.data(), value.size()}}}};
+    auto result = backend.BatchOffload(large, nullptr);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_TRUE(fs::is_empty(data_path));
+    // Rejection releases the reservation, allowing a smaller write to fit.
+    std::unordered_map<std::string, std::vector<Slice>> small{
+        {"small", {{value.data(), 1}}}};
+    ASSERT_TRUE(backend.BatchOffload(small, nullptr));
+    std::unordered_map<std::string, std::vector<Slice>> extra{
+        {"extra", {{value.data(), 1}}}};
+    EXPECT_FALSE(backend.BatchOffload(extra, nullptr));
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalCapIncludesOtherPendingWrites) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 1024 * 1024;
+    buckets.max_physical_bytes = 24 * 1024;
+    buckets.disk_scan_cache_ms = 3600000;
+    buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, buckets);
+    ASSERT_TRUE(backend.Init());
+    std::string value(8192, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> old{
+        {"old", {{value.data(), value.size()}}}};
+    ASSERT_TRUE(backend.BatchOffload(old, nullptr));
+    std::unordered_map<std::string, std::vector<Slice>> outer{
+        {"outer", {{value.data(), value.size()}}}};
+    std::unordered_map<std::string, std::vector<Slice>> nested{
+        {"nested", {{value.data(), 1}}}};
+    bool notified = false;
+    auto result = backend.BatchOffload(
+        outer, nullptr,
+        [&](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            notified = true;
+            // The outer write has reserved 16 KiB. The selected old bucket
+            // still occupies 16 KiB until this callback acknowledges eviction.
+            auto inner = backend.BatchOffload(nested, nullptr);
+            EXPECT_FALSE(inner);
+            if (!inner) EXPECT_EQ(inner.error(), ErrorCode::FILE_WRITE_FAIL);
+            return {};
+        });
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(notified);
+    EXPECT_TRUE(backend.IsExist("outer").value());
+    EXPECT_FALSE(backend.IsExist("nested").value());
+}
+
+TEST_F(StorageBackendTest,
+       BucketPhysicalAccountingReleasesRollbackAndRemoveAll) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 1024 * 1024;
+    buckets.max_physical_bytes = 16 * 1024;
+    buckets.disk_scan_cache_ms = 3600000;
+    buckets.eviction_policy = BucketEvictionPolicy::NONE;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    std::string value(8192, 'x');
+    for (int i = 0; i < 3; ++i) {
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"rollback", {{value.data(), value.size()}}}};
+        auto failed = backend.BatchOffload(batch, [](const auto&, auto&) {
+            return ErrorCode::INTERNAL_ERROR;
+        });
+        ASSERT_FALSE(failed);
+        EXPECT_EQ(failed.error(), ErrorCode::INTERNAL_ERROR);
+        EXPECT_TRUE(fs::is_empty(data_path));
+        ASSERT_TRUE(backend.BatchOffload(batch, nullptr));
+        backend.RemoveAll();
+        EXPECT_TRUE(fs::is_empty(data_path));
+    }
+    std::string metrics;
+    backend.offload_metrics_->Serialize(metrics);
+    EXPECT_NE(
+        metrics.find("mooncake_offload_disk_scan_operations_total 1.000000\n"),
+        std::string::npos);
+}
+
 TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
@@ -3299,6 +3547,7 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
 
     BucketStorageBackend storage_backend(config, bucket_config);
+    storage_backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
     ASSERT_TRUE(storage_backend.Init());
 
     std::vector<std::unique_ptr<char[]>> buffers;
@@ -3328,6 +3577,14 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     ASSERT_TRUE(evict_result.has_value());
     ASSERT_FALSE(evict_result.value().empty());
     EXPECT_EQ(notified_keys, evict_result.value());
+    const auto& diagnostics = *storage_backend.offload_metrics_;
+    EXPECT_EQ(
+        diagnostics.Get(OffloadMetrics::Counter::eviction_deleted_buckets),
+        evict_result.value().size());
+    EXPECT_EQ(diagnostics.Get(OffloadMetrics::Counter::eviction_deleted_bytes),
+              evict_result.value().size() * 6 * 1024);
+    EXPECT_EQ(
+        diagnostics.Get(OffloadMetrics::Counter::eviction_cleanup_failures), 0);
     EXPECT_EQ(evict_result.value().front(), "bucket_key_0");
 
     auto oldest_exists = storage_backend.IsExist("bucket_key_0");
@@ -3753,6 +4010,7 @@ TEST_F(StorageBackendTest,
     bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
 
     BucketStorageBackend storage_backend(config, bucket_config);
+    storage_backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
     ASSERT_TRUE(storage_backend.Init());
 
     std::vector<std::unique_ptr<char[]>> buffers;
@@ -3778,11 +4036,24 @@ TEST_F(StorageBackendTest,
         });
     ASSERT_FALSE(failed_evict.has_value());
     EXPECT_EQ(failed_evict.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(storage_backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_errors),
+              1);
+    EXPECT_EQ(storage_backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_deleted_bytes),
+              0);
 
     auto oldest_exists = storage_backend.IsExist("rollback_bucket_key_0");
     ASSERT_TRUE(oldest_exists.has_value());
     EXPECT_TRUE(oldest_exists.value());
 
+    const auto retry = storage_backend.DiskWatermarkEvictionRetryDelay();
+    ASSERT_TRUE(retry.has_value());
+    auto skipped = storage_backend.EvictAboveDiskWatermark(0.50, 0.25);
+    ASSERT_TRUE(skipped);
+    EXPECT_TRUE(skipped->empty());
+    EXPECT_TRUE(storage_backend.IsExist("rollback_bucket_key_0").value());
+    std::this_thread::sleep_for(*retry);
     auto successful_evict = storage_backend.EvictAboveDiskWatermark(
         /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.25,
         [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
@@ -3792,6 +4063,143 @@ TEST_F(StorageBackendTest,
     oldest_exists = storage_backend.IsExist("rollback_bucket_key_0");
     ASSERT_TRUE(oldest_exists.has_value());
     EXPECT_FALSE(oldest_exists.value());
+}
+
+TEST_F(StorageBackendTest,
+       BucketDiagnosticsReportLimitedPassAndActualDeletion) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.disk_eviction_high_watermark_ratio = 1e-8;
+    config.disk_eviction_low_watermark_ratio = 5e-9;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 16 * 1024 * 1024;
+    buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    char payload[8]{};
+    for (int i = 0; i < 1001; ++i) {
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"limited_" + std::to_string(i), {{payload, sizeof(payload)}}}};
+        ASSERT_TRUE(backend.BatchOffload(batch, nullptr));
+    }
+    const auto before = backend.GetStoreMetadata();
+    ASSERT_TRUE(before);
+    const double high = 0.9 * before->total_size / buckets.max_total_size;
+    auto first = backend.EvictAboveDiskWatermark(high, 5e-9);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->size(), 1000);
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_stop_bucket_limit),
+              1);
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_deleted_bytes),
+              8000);
+    EXPECT_GT(backend.offload_metrics_->Get(
+                  OffloadMetrics::Gauge::disk_logical_bytes),
+              0);
+    const auto after = backend.GetStoreMetadata();
+    ASSERT_TRUE(after);
+    EXPECT_LT(after->total_size, high * buckets.max_total_size);
+    EXPECT_EQ(backend.DiskWatermarkEvictionRetryDelay(),
+              std::chrono::milliseconds(0));
+    // Still below high: the old implementation incorrectly stopped here.
+    auto second = backend.EvictAboveDiskWatermark(high, 5e-9);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second->size(), 1);
+    EXPECT_FALSE(backend.DiskWatermarkEvictionRetryDelay());
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_deleted_bytes),
+              8008);
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Gauge::disk_logical_bytes),
+              0);
+}
+
+TEST_F(StorageBackendTest, BucketWatermarkEvictionYieldsToReaders) {
+    for (auto policy :
+         {BucketEvictionPolicy::FIFO, BucketEvictionPolicy::LRU}) {
+        FileStorageConfig config;
+        config.storage_filepath = data_path;
+        BucketBackendConfig buckets;
+        buckets.max_total_size = 30 * 1024;
+        buckets.eviction_policy = policy;
+        BucketStorageBackend backend(config, buckets);
+        ASSERT_TRUE(backend.Init());
+        std::string value(6 * 1024, 'x');
+        for (const auto& key : {"oldest", "newest"}) {
+            ASSERT_TRUE(backend.BatchOffload(
+                {{key, {{value.data(), value.size()}}}}, nullptr));
+        }
+        auto reader = PinBucket(backend, "oldest");
+        bool notified = false;
+        auto blocked = backend.EvictAboveDiskWatermark(
+            0.3, 0.15, [&](const auto&) -> tl::expected<void, ErrorCode> {
+                notified = true;
+                return {};
+            });
+        ASSERT_TRUE(blocked);
+        EXPECT_TRUE(blocked->empty());
+        EXPECT_FALSE(notified);
+        EXPECT_TRUE(backend.IsExist("oldest").value());
+        const auto retry = backend.DiskWatermarkEvictionRetryDelay();
+        ASSERT_TRUE(retry.has_value());
+        reader.reset();
+        std::this_thread::sleep_for(*retry);
+        auto evicted = backend.EvictAboveDiskWatermark(0.3, 0.15);
+        ASSERT_TRUE(evicted);
+        EXPECT_EQ(evicted->size(), 2);
+        EXPECT_FALSE(backend.DiskWatermarkEvictionRetryDelay());
+        backend.RemoveAll();
+    }
+}
+
+TEST_F(StorageBackendTest, BucketWatermarkEvictionBacksOffAfterCleanupFailure) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 30 * 1024;
+    buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    std::string value(6 * 1024, 'x');
+    for (const auto& key : {"oldest", "middle", "newest"}) {
+        ASSERT_TRUE(backend.BatchOffload(
+            {{key, {{value.data(), value.size()}}}}, nullptr));
+    }
+    const auto path = BucketPath(backend, "oldest");
+    // Force unlink failure without depending on root/non-root permissions.
+    ASSERT_TRUE(fs::remove(path));
+    fs::create_directory(path);
+    std::ofstream(path + "/busy") << "x";
+    auto result = backend.EvictAboveDiskWatermark(
+        0.5, 0.25, [&](const auto&) -> tl::expected<void, ErrorCode> {
+            EXPECT_TRUE(fs::exists(path));  // Notification precedes deletion.
+            // A concurrent write keeps usage above low after this pass.
+            EXPECT_TRUE(backend.BatchOffload(
+                {{"concurrent", {{value.data(), value.size()}}}}, nullptr));
+            return {};
+        });
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->size(),
+              2);  // Master removals are committed despite error.
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_cleanup_failures),
+              1);
+    EXPECT_TRUE(fs::exists(path));
+    EXPECT_FALSE(backend.IsExist("oldest").value());
+    const auto retry = backend.DiskWatermarkEvictionRetryDelay();
+    ASSERT_TRUE(retry.has_value());
+    auto skipped = backend.EvictAboveDiskWatermark(0.5, 0.25);
+    ASSERT_TRUE(skipped);
+    EXPECT_TRUE(skipped->empty());
+    EXPECT_TRUE(backend.IsExist("newest").value());
+    std::this_thread::sleep_for(*retry);
+    auto resumed = backend.EvictAboveDiskWatermark(0.5, 0.25);
+    ASSERT_TRUE(resumed);
+    EXPECT_EQ(resumed->size(), 1);
+    EXPECT_FALSE(backend.DiskWatermarkEvictionRetryDelay());
 }
 
 TEST_F(StorageBackendTest, BucketWatermarkEvictionNoopsWhenPolicyIsNone) {

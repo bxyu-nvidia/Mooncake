@@ -24,6 +24,28 @@ void SetEnv(const std::string& key, const std::string& value) {
 
 void UnsetEnv(const std::string& key) { unsetenv(key.c_str()); }
 
+class WatermarkRecordingBackend : public BucketStorageBackend {
+   public:
+    WatermarkRecordingBackend(const FileStorageConfig& config,
+                              const BucketBackendConfig& buckets)
+        : BucketStorageBackend(config, buckets) {}
+
+    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
+        double, double, EvictionHandler) override {
+        passes.push_back(std::chrono::steady_clock::now());
+        return std::vector<std::string>{};
+    }
+
+    std::optional<std::chrono::milliseconds> DiskWatermarkEvictionRetryDelay()
+        const override {
+        if (passes.size() >= pending_passes) return std::nullopt;
+        return std::chrono::milliseconds(0);
+    }
+
+    std::vector<std::chrono::steady_clock::time_point> passes;
+    size_t pending_passes = 0;
+};
+
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -135,6 +157,29 @@ class FileStorageTest : public ::testing::Test {
     static tl::expected<void, ErrorCode> FileStorageHeartbeat(
         FileStorage& fileStorage) {
         return fileStorage.Heartbeat();
+    }
+
+    static void SetBackend(FileStorage& storage,
+                           std::shared_ptr<StorageBackendInterface> backend) {
+        storage.storage_backend_ = std::move(backend);
+    }
+
+    static void WaitForNextHeartbeat(FileStorage& storage) {
+        storage.heartbeat_running_.store(true);
+        storage.WaitForNextHeartbeat();
+        storage.heartbeat_running_.store(false);
+    }
+
+    static tl::expected<void, ErrorCode> OffloadObjects(
+        FileStorage& storage, const std::vector<OffloadTaskItem>& tasks) {
+        return storage.OffloadObjects(tasks);
+    }
+
+    static void RunEvictionWithGates(FileStorage& storage, bool draining,
+                                     bool resync) {
+        storage.draining_.store(draining);
+        storage.metadata_resync_pending_.store(resync);
+        storage.RunDiskWatermarkEviction();
     }
 
     // Drives the drain-vs-heartbeat interleaving deterministically: a
@@ -330,7 +375,9 @@ TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 64 * 1024;
     file_storage_config.use_uring = false;
-    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    SsdMetric ssd_metrics;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003",
+                            &ssd_metrics);
 
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
@@ -348,6 +395,30 @@ TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
     for (const auto& handle : allocate_result.value()->handles) {
         EXPECT_EQ(handle.size(), 4 * 1024);
     }
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Gauge::read_buffer_in_use_bytes),
+              64 * 1024);
+    auto failed = FileStorageAllocateBatch(fileStorage, {"overflow"}, {1});
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Counter::read_buffer_allocation_failures),
+              1);
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Gauge::read_buffer_in_use_bytes),
+              64 * 1024);
+    allocate_result.value().reset();
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Gauge::read_buffer_in_use_bytes),
+              0);
+    EXPECT_EQ(
+        ssd_metrics.offload->Get(OffloadMetrics::Gauge::read_buffer_batches),
+        0);
+    auto partial = FileStorageAllocateBatch(fileStorage, {"first", "second"},
+                                            {40 * 1024, 40 * 1024});
+    EXPECT_FALSE(partial);
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Gauge::read_buffer_in_use_bytes),
+              0);
 }
 
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
@@ -496,6 +567,73 @@ TEST_F(FileStorageTest, ReadBucketBackendValues) {
     const auto config = BucketBackendConfig::FromEnvironment();
     EXPECT_EQ(config.bucket_keys_limit, 1000);
     EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
+}
+
+TEST_F(FileStorageTest, WatermarkPassesContinueBetweenHeartbeats) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 64 * 1024;
+    config.heartbeat_interval_seconds = 1;
+    config.enable_disk_watermark_eviction = true;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    auto backend = std::make_shared<WatermarkRecordingBackend>(
+        config, BucketBackendConfig{});
+    backend->pending_passes = 2;
+    SetBackend(storage, backend);
+    WaitForNextHeartbeat(storage);
+    ASSERT_EQ(backend->passes.size(), 2);
+    EXPECT_GE(backend->passes[1] - backend->passes[0],
+              std::chrono::milliseconds(10));
+    // Completing the cycle stops further passes in the same wait interval.
+    EXPECT_FALSE(backend->DiskWatermarkEvictionRetryDelay());
+}
+
+TEST_F(FileStorageTest, WatermarkEvictionHonorsDisableDrainAndResync) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 64 * 1024;
+    config.enable_disk_watermark_eviction = false;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    auto backend = std::make_shared<WatermarkRecordingBackend>(
+        config, BucketBackendConfig{});
+    SetBackend(storage, backend);
+    RunEvictionWithGates(storage, false, false);
+    EXPECT_TRUE(backend->passes.empty());
+    storage.config_.enable_disk_watermark_eviction = true;
+    RunEvictionWithGates(storage, true, false);
+    RunEvictionWithGates(storage, false, true);
+    EXPECT_TRUE(backend->passes.empty());
+    RunEvictionWithGates(storage, false, false);
+    EXPECT_EQ(backend->passes.size(), 1);
+}
+
+TEST_F(FileStorageTest, WatermarkEvictionRunsBeforeEveryOffloadBucket) {
+    const auto master_root = fs::path(data_path) / "master";
+    fs::create_directories(master_root);
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_enable_offload(true)
+                                 .set_root_fs_dir(master_root.string())
+                                 .build()));
+    const auto addr = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 64 * 1024;
+    config.enable_disk_watermark_eviction = true;
+    BucketBackendConfig buckets;
+    buckets.bucket_keys_limit = 1;
+    FileStorage storage(config, client.value(), addr);
+    auto backend = std::make_shared<WatermarkRecordingBackend>(config, buckets);
+    SetBackend(storage, backend);
+    // Missing source objects exercise the early-continue path as well as
+    // grouping: cleanup must run before each bucket, not only after writes.
+    ASSERT_TRUE(OffloadObjects(
+        storage, {{.tenant_id = "default", .key = "first", .size = 8},
+                  {.tenant_id = "default", .key = "second", .size = 8}}));
+    EXPECT_EQ(backend->passes.size(), 2);
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {

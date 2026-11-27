@@ -103,13 +103,27 @@ class FileStorage {
         uint64_t total_size;
 
         AllocatedBatch() : batch_id(0), total_size(0) {}
-        AllocatedBatch(AllocatedBatch&&) = default;
-        AllocatedBatch& operator=(AllocatedBatch&&) = default;
+        AllocatedBatch(AllocatedBatch&&) = delete;
+        AllocatedBatch& operator=(AllocatedBatch&&) = delete;
 
         AllocatedBatch(const AllocatedBatch&) = delete;
         AllocatedBatch& operator=(const AllocatedBatch&) = delete;
 
-        ~AllocatedBatch() = default;
+        std::shared_ptr<OffloadMetrics> metrics;
+        int64_t allocated_bytes = 0;
+        int64_t allocated_at_us = 0;
+        ~AllocatedBatch() {
+            handles.clear();
+            if (metrics) {
+                metrics->AddGauge(
+                    OffloadMetrics::Gauge::read_buffer_in_use_bytes,
+                    -allocated_bytes);
+                metrics->AddGauge(OffloadMetrics::Gauge::read_buffer_batches,
+                                  -1);
+                metrics->Observe(OffloadMetrics::Phase::read_buffer_lifetime,
+                                 OffloadMetrics::NowUs() - allocated_at_us);
+            }
+        }
     };
 
     /**
@@ -144,11 +158,12 @@ class FileStorage {
      * 1. Sends object status (e.g., access frequency, size) to the master via
      * client.
      * 2. Receives feedback on which objects should be offloaded.
-     * 3. Triggers asynchronous offloading of pending objects.
+     * 3. Runs a bounded disk-watermark pass before each offload bucket.
      * 4. If offload work was returned, pulls and processes any pending L2->L1
      *    promotion tasks queued by the master (mirror of step 1+2 in the
      *    reverse direction).
-     * 5. Runs proactive local-disk watermark eviction.
+     * 5. Runs a final watermark pass; unfinished cleanup continues between
+     *    heartbeat ticks on the same thread.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
@@ -167,7 +182,9 @@ class FileStorage {
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
-    tl::expected<void, ErrorCode> RunDiskWatermarkEviction();
+    void RunDiskWatermarkEviction();
+
+    void WaitForNextHeartbeat();
 
     tl::expected<void, ErrorCode> NotifyEvictedDiskReplicas(
         const std::vector<std::string>& evicted_keys);
@@ -200,6 +217,7 @@ class FileStorage {
 
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
+    std::shared_ptr<OffloadMetrics> offload_metrics_;
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;

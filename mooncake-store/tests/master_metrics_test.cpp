@@ -1168,3 +1168,25 @@ int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
+
+TEST(MemoryEvictionMetricsTest, ExportsPendingWorkAndPassTiming) {
+    auto& metrics = mooncake::MasterMetricManager::instance();
+    const auto initial = metrics.get_pending_offload_bytes();
+    metrics.add_pending_offload(1, 8192);
+    metrics.observe_mem_eviction_pass(64, 2, 4.0, 6.0, 12.0);
+    metrics.set_mem_eviction_backoff_ms(80);
+    const auto text = metrics.serialize_metrics();
+    for (const char* name :
+         {"master_offload_pending_bytes", "master_offload_pending_objects",
+          "master_mem_eviction_scanned_total",
+          "master_mem_eviction_lock_acquisitions_total",
+          "master_mem_eviction_lock_wait_ms_sum",
+          "master_mem_eviction_lock_hold_ms_sum",
+          "master_mem_eviction_duration_ms_sum",
+          "master_mem_eviction_backoff_ms"}) {
+        EXPECT_NE(text.find(name), std::string::npos) << name;
+    }
+    EXPECT_EQ(metrics.get_pending_offload_bytes(), initial + 8192);
+    metrics.add_pending_offload(-1, -8192);
+    EXPECT_EQ(metrics.get_pending_offload_bytes(), initial);
+}

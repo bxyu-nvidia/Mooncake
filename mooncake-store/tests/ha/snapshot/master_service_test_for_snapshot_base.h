@@ -746,6 +746,26 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Core Test Method ====================
 
+    void CheckMemoryEvictionIndex(MasterService& service) {
+        for (size_t i = 0; i < MasterService::kNumShards; ++i) {
+            MasterService::MetadataShardAccessorRW shard(&service, i);
+            std::unordered_set<const MasterService::ObjectMetadata*> expected;
+            for (const auto& [tenant_id, tenant] : shard->tenants) {
+                for (const auto& [key, metadata] : tenant.metadata) {
+                    if (metadata.HasMemReplica() && !metadata.IsHardPinned()) {
+                        expected.insert(&metadata);
+                    }
+                }
+            }
+            EXPECT_EQ(shard->memory_candidates.size(), expected.size());
+            shard->memory_candidates.Visit(
+                expected.size(), [&](const auto& metadata) {
+                    EXPECT_EQ(expected.erase(&metadata), 1);
+                });
+            EXPECT_TRUE(expected.empty());
+        }
+    }
+
     // Test snapshot and restore functionality
     void TestSnapshotAndRestore(std::unique_ptr<MasterService>& service) {
         // ========== Phase 1: Manually persist metadata ==========
@@ -772,6 +792,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
         ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+
+        CheckMemoryEvictionIndex(*restored_service);
 
         // ========== Phase 4: Persist restored metadata again ==========
         std::string snapshot_id2 = GenerateSnapshotId();

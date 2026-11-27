@@ -1,4 +1,5 @@
 #pragma once
+#include "offload_metrics.h"
 
 #include <algorithm>
 #include <array>
@@ -33,6 +34,7 @@
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
+#include "memory_eviction.h"
 #include "mutex.h"
 #include "segment.h"
 #include "local_ssd/manager.h"
@@ -80,6 +82,7 @@ struct MetadataStoragePlugin;
 // Forward declarations for test classes
 namespace test {
 class MasterServiceTest;
+class MasterServiceSSDTest;
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
 // Friended so the promotion-on-hit tests can drive a serialize/reset/
@@ -147,6 +150,7 @@ class MasterService {
     // Test friend class for snapshot/restore testing
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::MasterServiceTest;
+    friend class test::MasterServiceSSDTest;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
     friend class test::DynamicReplicationTest;
@@ -974,15 +978,18 @@ class MasterService {
     tl::expected<void, SerializationError> ApplySnapshotState(
         const std::chrono::system_clock::time_point& now);
 
-    // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
-    // object with smaller lease timeout. It has two passes. The first pass only
-    // evicts objects without soft pin. The second pass prioritizes objects
-    // without soft pin, but also allows to evict soft pinned objects if
-    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
-    // evict ratio target. If the actual evicted ratio is less than
-    // evict_ratio_lowerbound, the second pass will be triggered and try to
-    // fulfill evict ratio lowerbound.
-    void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // Bounded near-LRU sampling over memory-resident objects. Ratios apply to
+    // the sampled evictable population. Unpinned candidates meet the target;
+    // soft pins are considered only to meet the lower bound when permitted.
+    struct MemoryEvictionResult {
+        size_t scanned{0};
+        long target{0};
+        long evicted{0};
+        uint64_t freed_bytes{0};
+    };
+    MemoryEvictionResult BatchEvict(double evict_ratio_target,
+                                    double evict_ratio_lowerbound);
+    size_t memory_eviction_next_shard_{0};
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     struct TenantQuotaEvictionResult {
@@ -1029,6 +1036,9 @@ class MasterService {
         uint64_t ttl_ms{0};
     };
 
+    struct ObjectMetadata;
+    using MemoryIndex = MemoryEvictionIndex<ObjectMetadata>;
+
     struct ObjectMetadata {
         struct SoftPinEvaluation {
             bool active{false};
@@ -1065,7 +1075,7 @@ class MasterService {
             bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
             std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-            std::string user_key_ = {})
+            std::string user_key_ = {}, MemoryIndex* memory_index = nullptr)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -1074,9 +1084,12 @@ class MasterService {
               tenant_id(std::move(tenant_id_)),
               user_key(std::move(user_key_)),
               lease_timeout(),
+              memory_lease_timeout(),
               soft_pin_timeout(std::move(committed_soft_pin_timeout)),
               hard_pinned(enable_hard_pin),
+              memory_membership_(memory_index, this),
               replicas_(std::move(reps)) {
+            RefreshMemoryIndex();
             MasterMetricManager::instance().inc_key_count(1);
             if (soft_pin_timeout) {
                 MasterMetricManager::instance().inc_soft_pin_key_count(1);
@@ -1109,6 +1122,9 @@ class MasterService {
         // the Clock's epoch (i.e., time_since_epoch() is zero).
         mutable std::chrono::system_clock::time_point lease_timeout
             GUARDED_BY(lock);  // hard lease
+        mutable std::chrono::system_clock::time_point memory_lease_timeout
+            GUARDED_BY(
+                lock);  // protects memory descriptors returned to readers
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
                                                 // deadline
@@ -1174,6 +1190,7 @@ class MasterService {
             replicas_.insert(replicas_.end(),
                              std::move_iterator(replicas.begin()),
                              std::move_iterator(replicas.end()));
+            RefreshMemoryIndex();
         }
 
         std::vector<Replica> PopReplicas(
@@ -1193,10 +1210,16 @@ class MasterService {
                 replicas_.erase(partition_point, replicas_.end());
             }
 
+            RefreshMemoryIndex();
             return popped_replicas;
         }
 
-        std::vector<Replica> PopReplicas() { return std::move(replicas_); }
+        std::vector<Replica> PopReplicas() {
+            std::vector<Replica> result;
+            result.swap(replicas_);
+            RefreshMemoryIndex();
+            return result;
+        }
 
         size_t EraseReplicas(
             const std::function<bool(const Replica&)>& pred_fn) {
@@ -1325,18 +1348,31 @@ class MasterService {
 
         // Grant an ordinary read lease with timeout as now() + ttl. Soft-pin
         // lifetime is intentionally independent from reads.
-        void GrantReadLease(const uint64_t ttl) const {
+        void GrantReadLease(const uint64_t ttl,
+                            bool protect_memory = true) const {
             SpinLocker locker(&lock);
             std::chrono::system_clock::time_point now =
                 std::chrono::system_clock::now();
-            lease_timeout =
-                std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
+            const auto deadline = now + std::chrono::milliseconds(ttl);
+            lease_timeout = std::max(lease_timeout, deadline);
+            if (protect_memory) {
+                memory_lease_timeout = std::max(memory_lease_timeout, deadline);
+            }
         }
 
-        bool NeedsReadLeaseRefresh(const uint64_t ttl) const {
+        bool NeedsReadLeaseRefresh(const uint64_t ttl,
+                                   bool protect_memory = true) const {
             SpinLocker locker(&lock);
             const auto now = std::chrono::system_clock::now();
-            return lease_timeout <= now + std::chrono::milliseconds(ttl / 2);
+            const auto deadline =
+                protect_memory ? memory_lease_timeout : lease_timeout;
+            return deadline <= now + std::chrono::milliseconds(ttl / 2);
+        }
+
+        bool IsMemoryLeaseExpired(
+            const std::chrono::system_clock::time_point& now) const {
+            SpinLocker locker(&lock);
+            return now >= memory_lease_timeout;
         }
 
         // Check if the lease has expired
@@ -1534,6 +1570,10 @@ class MasterService {
         }
 
        private:
+        void RefreshMemoryIndex() {
+            memory_membership_.SetResident(!hard_pinned && HasMemReplica());
+        }
+        MemoryIndex::Membership memory_membership_;
         // Use the accessors to visit and modify the replicas.
         std::vector<Replica> replicas_;
     };
@@ -1565,6 +1605,43 @@ class MasterService {
     };
 
     struct OffloadingTask {
+        OffloadingTask(ReplicaID source,
+                       std::chrono::system_clock::time_point start,
+                       std::vector<UUID> mirrors, uint64_t bytes)
+            : source_id(source),
+              start_time(start),
+              mirror_clients(std::move(mirrors)),
+              pending_bytes(bytes) {
+            OffloadSourceMetrics::Instance().Admit(metrics_start_us,
+                                                   pending_bytes);
+            MasterMetricManager::instance().add_pending_offload(1,
+                                                                pending_bytes);
+        }
+        OffloadingTask(OffloadingTask&& other) noexcept
+            : source_id(other.source_id),
+              start_time(other.start_time),
+              mirror_clients(std::move(other.mirror_clients)),
+              pending_bytes(std::exchange(other.pending_bytes, 0)),
+              counted(std::exchange(other.counted, false)),
+              metrics_start_us(other.metrics_start_us),
+              metrics_dispatched(other.metrics_dispatched) {}
+        OffloadingTask(const OffloadingTask&) = delete;
+        OffloadingTask& operator=(const OffloadingTask&) = delete;
+        void MarkDispatched() const {
+            if (!metrics_dispatched) {
+                OffloadSourceMetrics::Instance().Dispatch(metrics_start_us,
+                                                          pending_bytes);
+                metrics_dispatched = true;
+            }
+        }
+        ~OffloadingTask() {
+            if (counted)
+                OffloadSourceMetrics::Instance().Release(
+                    metrics_start_us, pending_bytes, metrics_dispatched);
+            if (counted)
+                MasterMetricManager::instance().add_pending_offload(
+                    -1, -static_cast<int64_t>(pending_bytes));
+        }
         ReplicaID source_id;
         std::chrono::system_clock::time_point start_time;
         // Clients whose LocalDiskSegment::offloading_objects hold a mirror
@@ -1572,6 +1649,10 @@ class MasterService {
         // offload is pushed once per completed MEMORY replica and those
         // replicas may live on different clients.
         std::vector<UUID> mirror_clients;
+        uint64_t pending_bytes;
+        bool counted{true};
+        int64_t metrics_start_us{OffloadMetrics::NowUs()};
+        mutable bool metrics_dispatched{false};
     };
 
     // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
@@ -1685,6 +1766,8 @@ class MasterService {
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
         mutable SharedMutex mutex;
+        // Declared before tenants so memberships unregister before this dies.
+        MemoryIndex memory_candidates GUARDED_BY(mutex);
         std::unordered_map<TenantId, TenantState, TenantIdHash> tenants
             GUARDED_BY(mutex);
         // Count of objects that have at least one completed LOCAL_DISK replica.
@@ -1743,6 +1826,9 @@ class MasterService {
 
     static bool HasCompletedMemoryCacheReplica(const ObjectMetadata& metadata);
     static bool HasCompletedDiskCacheReplica(const ObjectMetadata& metadata);
+    bool IsMemoryEvictionLeaseExpired(
+        const ObjectMetadata& metadata,
+        std::chrono::system_clock::time_point& now) const;
     static void SyncCacheTotalAccounting(ObjectMetadata& metadata);
     void RebuildCacheTotalAccounting();
     static void AccountCacheTotalRemoval(ObjectMetadata& metadata);
@@ -1775,13 +1861,38 @@ class MasterService {
 
     std::array<std::mutex, kObjectOperationLockStripes> object_operation_locks_;
 
+    struct EvictionLockStats {
+        uint64_t acquisitions{0};
+        double wait_us{0};
+        double hold_us{0};
+    };
+
     // For accessing a metadata shard with read-write permission
     class MetadataShardAccessorRW {
        public:
         MetadataShardAccessorRW(MasterService* master_service,
-                                size_t shard_index)
+                                size_t shard_index,
+                                EvictionLockStats* timings = nullptr)
             : shard_(master_service->metadata_shards_[shard_index]),
-              lock_(&shard_.mutex) {}
+              timings_(timings),
+              wait_start_(timings ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{}),
+              lock_(&shard_.mutex),
+              acquired_(timings ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{}) {}
+
+        ~MetadataShardAccessorRW() {
+            if (timings_) {
+                ++timings_->acquisitions;
+                timings_->wait_us += std::chrono::duration<double, std::micro>(
+                                         acquired_ - wait_start_)
+                                         .count();
+                timings_->hold_us +=
+                    std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - acquired_)
+                        .count();
+            }
+        }
 
         MetadataShard* operator->() { return &shard_; }
 
@@ -1821,7 +1932,10 @@ class MasterService {
 
        private:
         MetadataShard& shard_;
+        EvictionLockStats* timings_;
+        std::chrono::steady_clock::time_point wait_start_;
         SharedMutexLocker lock_;
+        std::chrono::steady_clock::time_point acquired_;
     };
 
     // For accessing a metadata shard with read-only permission
@@ -1951,7 +2065,8 @@ class MasterService {
     void RebuildGroupRoutingIndex();
     void GrantLeaseForGroup(const TenantState& tenant_state,
                             const std::string& key,
-                            const ObjectMetadata& metadata) const;
+                            const ObjectMetadata& metadata,
+                            bool protect_memory = true) const;
     static void ApplySoftPinMetricDelta(int metric_delta);
     size_t GetMetadataShardIndex(const ObjectMetadata& metadata) const;
     void ApplySoftPinEvaluation(
@@ -2296,10 +2411,11 @@ class MasterService {
             auto result = tenant_state_->metadata.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(object_id_.user_key),
-                std::forward_as_tuple(
-                    client_id, now, total_length, std::move(replicas),
-                    std::nullopt, enable_hard_pin, data_type, group_id,
-                    object_id_.tenant_id, object_id_.user_key));
+                std::forward_as_tuple(client_id, now, total_length,
+                                      std::move(replicas), std::nullopt,
+                                      enable_hard_pin, data_type, group_id,
+                                      object_id_.tenant_id, object_id_.user_key,
+                                      &shard_guard_->memory_candidates));
             it_ = result.first;
         }
 
