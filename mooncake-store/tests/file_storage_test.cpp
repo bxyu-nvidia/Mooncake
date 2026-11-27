@@ -330,7 +330,9 @@ TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 64 * 1024;
     file_storage_config.use_uring = false;
-    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    SsdMetric ssd_metrics;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003",
+                            &ssd_metrics);
 
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
@@ -348,6 +350,30 @@ TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
     for (const auto& handle : allocate_result.value()->handles) {
         EXPECT_EQ(handle.size(), 4 * 1024);
     }
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Gauge::read_buffer_in_use_bytes),
+              64 * 1024);
+    auto failed = FileStorageAllocateBatch(fileStorage, {"overflow"}, {1});
+    EXPECT_FALSE(failed);
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Counter::read_buffer_allocation_failures),
+              1);
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Gauge::read_buffer_in_use_bytes),
+              64 * 1024);
+    allocate_result.value().reset();
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Gauge::read_buffer_in_use_bytes),
+              0);
+    EXPECT_EQ(
+        ssd_metrics.offload->Get(OffloadMetrics::Gauge::read_buffer_batches),
+        0);
+    auto partial = FileStorageAllocateBatch(fileStorage, {"first", "second"},
+                                            {40 * 1024, 40 * 1024});
+    EXPECT_FALSE(partial);
+    EXPECT_EQ(ssd_metrics.offload->Get(
+                  OffloadMetrics::Gauge::read_buffer_in_use_bytes),
+              0);
 }
 
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {

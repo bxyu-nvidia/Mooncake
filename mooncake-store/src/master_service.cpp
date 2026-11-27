@@ -7335,6 +7335,16 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         return tl::make_unexpected(pending.error());
     }
     if (enable_offloading) {
+        // Only the offload dispatch path touches these counters. Existing
+        // metadata locks serialize first dispatch across mirrored queues.
+        for (const auto& task : *pending) {
+            MetadataAccessorRW accessor(
+                this, MakeObjectIdentity(task.key, TenantId(task.tenant_id)));
+            if (!accessor.Exists()) continue;
+            const auto& tasks = accessor.GetTenantState().offloading_tasks;
+            auto it = tasks.find(task.key);
+            if (it != tasks.end()) it->second.MarkDispatched();
+        }
         return std::move(*pending);
     }
     // Offloading is disabled: clear the pending queue to prevent unbounded
@@ -9428,6 +9438,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     source->dec_refcnt();
                 }
             }
+            OffloadSourceMetrics::Instance().Expired();
             LOG(WARNING) << "Offloading task expired for key: "
                          << task_it->first << " tenant=" << tenant_it->first;
             task_it = tenant_state.offloading_tasks.erase(task_it);

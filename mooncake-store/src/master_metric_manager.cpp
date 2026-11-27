@@ -1,4 +1,5 @@
 #include "master_metric_manager.h"
+#include "offload_metrics.h"
 
 #include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
@@ -2027,6 +2028,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_evicted_key_count_);
     serialize_metric(nof_evicted_size_);
 
+    {
+        std::string diagnostics;
+        OffloadSourceMetrics::Instance().Serialize(diagnostics);
+        ss << diagnostics;
+    }
     serialize_metric(pending_offload_bytes_);
     serialize_metric(pending_offload_tasks_);
     serialize_metric(mem_eviction_scanned_);

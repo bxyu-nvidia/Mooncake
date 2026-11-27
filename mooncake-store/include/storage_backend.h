@@ -1,4 +1,5 @@
 #pragma once
+#include "offload_metrics.h"
 
 #include <glog/logging.h>
 
@@ -440,6 +441,7 @@ class StorageBackendInterface {
         return std::vector<std::string>{};
     }
 
+    std::shared_ptr<OffloadMetrics> offload_metrics_;
     FileStorageConfig file_storage_config_;
 };
 
@@ -1208,6 +1210,13 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable SharedMutex mutex_;
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
+    void ObserveDiskUsageLocked() {
+        if (offload_metrics_)
+            offload_metrics_->Usage(
+                total_size_, bucket_backend_config_.max_total_size,
+                file_storage_config_.disk_eviction_high_watermark_ratio,
+                file_storage_config_.disk_eviction_low_watermark_ratio);
+    }
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;

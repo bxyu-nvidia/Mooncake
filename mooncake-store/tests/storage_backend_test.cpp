@@ -3299,6 +3299,7 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
 
     BucketStorageBackend storage_backend(config, bucket_config);
+    storage_backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
     ASSERT_TRUE(storage_backend.Init());
 
     std::vector<std::unique_ptr<char[]>> buffers;
@@ -3328,6 +3329,14 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
     ASSERT_TRUE(evict_result.has_value());
     ASSERT_FALSE(evict_result.value().empty());
     EXPECT_EQ(notified_keys, evict_result.value());
+    const auto& diagnostics = *storage_backend.offload_metrics_;
+    EXPECT_EQ(
+        diagnostics.Get(OffloadMetrics::Counter::eviction_deleted_buckets),
+        evict_result.value().size());
+    EXPECT_EQ(diagnostics.Get(OffloadMetrics::Counter::eviction_deleted_bytes),
+              evict_result.value().size() * 6 * 1024);
+    EXPECT_EQ(
+        diagnostics.Get(OffloadMetrics::Counter::eviction_cleanup_failures), 0);
     EXPECT_EQ(evict_result.value().front(), "bucket_key_0");
 
     auto oldest_exists = storage_backend.IsExist("bucket_key_0");
@@ -3753,6 +3762,7 @@ TEST_F(StorageBackendTest,
     bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
 
     BucketStorageBackend storage_backend(config, bucket_config);
+    storage_backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
     ASSERT_TRUE(storage_backend.Init());
 
     std::vector<std::unique_ptr<char[]>> buffers;
@@ -3778,6 +3788,12 @@ TEST_F(StorageBackendTest,
         });
     ASSERT_FALSE(failed_evict.has_value());
     EXPECT_EQ(failed_evict.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(storage_backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_errors),
+              1);
+    EXPECT_EQ(storage_backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_deleted_bytes),
+              0);
 
     auto oldest_exists = storage_backend.IsExist("rollback_bucket_key_0");
     ASSERT_TRUE(oldest_exists.has_value());
@@ -3792,6 +3808,47 @@ TEST_F(StorageBackendTest,
     oldest_exists = storage_backend.IsExist("rollback_bucket_key_0");
     ASSERT_TRUE(oldest_exists.has_value());
     EXPECT_FALSE(oldest_exists.value());
+}
+
+TEST_F(StorageBackendTest,
+       BucketDiagnosticsReportLimitedPassAndActualDeletion) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.disk_eviction_high_watermark_ratio = 1e-8;
+    config.disk_eviction_low_watermark_ratio = 5e-9;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 16 * 1024 * 1024;
+    buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    char payload[8]{};
+    for (int i = 0; i < 1001; ++i) {
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"limited_" + std::to_string(i), {{payload, sizeof(payload)}}}};
+        ASSERT_TRUE(backend.BatchOffload(batch, nullptr));
+    }
+    auto first = backend.EvictAboveDiskWatermark(1e-8, 5e-9);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->size(), 1000);
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_stop_bucket_limit),
+              1);
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_deleted_bytes),
+              8000);
+    EXPECT_GT(backend.offload_metrics_->Get(
+                  OffloadMetrics::Gauge::disk_logical_bytes),
+              0);
+    auto second = backend.EvictAboveDiskWatermark(1e-8, 5e-9);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(second->size(), 1);
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_deleted_bytes),
+              8008);
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Gauge::disk_logical_bytes),
+              0);
 }
 
 TEST_F(StorageBackendTest, BucketWatermarkEvictionNoopsWhenPolicyIsNone) {

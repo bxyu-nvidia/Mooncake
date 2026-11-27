@@ -1,4 +1,5 @@
 #pragma once
+#include "offload_metrics.h"
 
 #include <algorithm>
 #include <array>
@@ -1611,6 +1612,8 @@ class MasterService {
               start_time(start),
               mirror_clients(std::move(mirrors)),
               pending_bytes(bytes) {
+            OffloadSourceMetrics::Instance().Admit(metrics_start_us,
+                                                   pending_bytes);
             MasterMetricManager::instance().add_pending_offload(1,
                                                                 pending_bytes);
         }
@@ -1619,10 +1622,22 @@ class MasterService {
               start_time(other.start_time),
               mirror_clients(std::move(other.mirror_clients)),
               pending_bytes(std::exchange(other.pending_bytes, 0)),
-              counted(std::exchange(other.counted, false)) {}
+              counted(std::exchange(other.counted, false)),
+              metrics_start_us(other.metrics_start_us),
+              metrics_dispatched(other.metrics_dispatched) {}
         OffloadingTask(const OffloadingTask&) = delete;
         OffloadingTask& operator=(const OffloadingTask&) = delete;
+        void MarkDispatched() const {
+            if (!metrics_dispatched) {
+                OffloadSourceMetrics::Instance().Dispatch(metrics_start_us,
+                                                          pending_bytes);
+                metrics_dispatched = true;
+            }
+        }
         ~OffloadingTask() {
+            if (counted)
+                OffloadSourceMetrics::Instance().Release(
+                    metrics_start_us, pending_bytes, metrics_dispatched);
             if (counted)
                 MasterMetricManager::instance().add_pending_offload(
                     -1, -static_cast<int64_t>(pending_bytes));
@@ -1636,6 +1651,8 @@ class MasterService {
         std::vector<UUID> mirror_clients;
         uint64_t pending_bytes;
         bool counted{true};
+        int64_t metrics_start_us{OffloadMetrics::NowUs()};
+        mutable bool metrics_dispatched{false};
     };
 
     // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source

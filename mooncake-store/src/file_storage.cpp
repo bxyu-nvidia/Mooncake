@@ -45,6 +45,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     : config_(config),
       client_(client),
       ssd_metric_(ssd_metric),
+      offload_metrics_(ssd_metric ? ssd_metric->offload : nullptr),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
@@ -86,6 +87,13 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     }
 
     storage_backend_ = create_storage_backend_result.value();
+    storage_backend_->offload_metrics_ = offload_metrics_;
+    if (offload_metrics_)
+        offload_metrics_->Set(OffloadMetrics::Gauge::read_buffer_capacity_bytes,
+                              client_buffer_allocator_->size() +
+                                  (pinned_restore_arena_allocator_
+                                       ? pinned_restore_arena_allocator_->size()
+                                       : 0));
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
@@ -308,6 +316,33 @@ bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
+    OffloadTimer batch_timer(offload_metrics_.get(),
+                             OffloadMetrics::Phase::offload_batch);
+    struct Progress {
+        OffloadMetrics* metrics;
+        ~Progress() {
+            if (!metrics) return;
+            metrics->Set(OffloadMetrics::Gauge::offload_batch_remaining_bytes,
+                         0);
+            metrics->Set(OffloadMetrics::Gauge::offload_batch_remaining_objects,
+                         0);
+            metrics->batch_since_us.store(0);
+        }
+    } progress{offload_metrics_.get()};
+    if (offload_metrics_ && !offloading_objects.empty()) {
+        int64_t bytes = 0;
+        for (const auto& task : offloading_objects) bytes += task.size;
+        offload_metrics_->batch_since_us.store(OffloadMetrics::NowUs());
+        offload_metrics_->Set(
+            OffloadMetrics::Gauge::offload_batch_remaining_bytes, bytes);
+        offload_metrics_->Set(
+            OffloadMetrics::Gauge::offload_batch_remaining_objects,
+            offloading_objects.size());
+        offload_metrics_->Add(OffloadMetrics::Counter::offload_received_objects,
+                              offloading_objects.size());
+        offload_metrics_->Add(OffloadMetrics::Counter::offload_received_bytes,
+                              bytes);
+    }
     if (offloading_objects.empty()) {
         return {};
     }
@@ -359,6 +394,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             tasks.push_back(it->second);
         }
+        OffloadTimer ack_timer(offload_metrics_.get(),
+                               OffloadMetrics::Phase::offload_ack);
         auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (!result) {
             LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess failed with error: "
@@ -379,6 +416,30 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::optional<ErrorCode> abort_error;
 
     for (const auto& keys : buckets_keys) {
+        int64_t bucket_bytes = 0;
+        int64_t bucket_objects = 0;
+        for (const auto& key : keys) {
+            auto it = storage_object_sizes.find(key);
+            if (it != storage_object_sizes.end()) {
+                bucket_bytes += it->second;
+                ++bucket_objects;
+            }
+        }
+        struct BucketProgress {
+            OffloadMetrics* metrics;
+            int64_t bytes, objects;
+            ~BucketProgress() {
+                if (!metrics) return;
+                metrics->AddGauge(
+                    OffloadMetrics::Gauge::offload_batch_remaining_bytes,
+                    -bytes);
+                metrics->AddGauge(
+                    OffloadMetrics::Gauge::offload_batch_remaining_objects,
+                    -objects);
+            }
+        } bucket_progress{offload_metrics_.get(), bucket_bytes, bucket_objects};
+        OffloadTimer staging_timer(offload_metrics_.get(),
+                                   OffloadMetrics::Phase::offload_staging);
         for (const auto& k : keys) all_bucket_keys.insert(k);
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         std::unordered_map<std::string, std::vector<std::string>>
@@ -469,6 +530,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
+        staging_timer.Stop();
         auto offload_start = std::chrono::steady_clock::now();
         auto bucket_complete_handler =
             [this, offload_start, complete_handler](
@@ -548,6 +610,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         for (size_t i = 0; i < failed_tasks.size(); ++i) {
             failed_metadatas.push_back(StorageObjectMetadata{-1, 0, 0, -1, ""});
         }
+        OffloadTimer ack_timer(offload_metrics_.get(),
+                               OffloadMetrics::Phase::offload_ack);
         auto result =
             client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
         if (!result) {
@@ -647,6 +711,8 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
 }
 
 tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
+    OffloadTimer timer(offload_metrics_.get(),
+                       OffloadMetrics::Phase::heartbeat);
     if (client_ == nullptr) {
         LOG(ERROR) << "client is nullptr";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -697,6 +763,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
             return {};
         }
         auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
+            OffloadTimer rpc_timer(offload_metrics_.get(),
+                                   OffloadMetrics::Phase::heartbeat_rpc);
             return client_->OffloadObjectHeartbeat(enable_offloading_,
                                                    offloading_objects);
         };
@@ -1086,6 +1154,17 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto result = std::make_shared<AllocatedBatch>();
+    result->metrics = offload_metrics_;
+    if (result->metrics) {
+        result->allocated_at_us = OffloadMetrics::NowUs();
+        result->metrics->AddGauge(OffloadMetrics::Gauge::read_buffer_batches,
+                                  1);
+        result->metrics->Add(OffloadMetrics::Counter::read_buffer_requests);
+        for (auto size : sizes)
+            if (size > 0)
+                result->metrics->Add(
+                    OffloadMetrics::Counter::read_buffer_requested_bytes, size);
+    }
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
@@ -1130,9 +1209,20 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
             alloc_result = allocator.allocate(alloc_size);
         }
         if (!alloc_result) {
+            if (offload_metrics_)
+                offload_metrics_->Add(
+                    OffloadMetrics::Counter::read_buffer_allocation_failures);
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
 
+        result->allocated_bytes += alloc_result->size();
+        if (offload_metrics_) {
+            const auto in_use = offload_metrics_->AddGauge(
+                OffloadMetrics::Gauge::read_buffer_in_use_bytes,
+                alloc_result->size());
+            offload_metrics_->Max(OffloadMetrics::Gauge::read_buffer_peak_bytes,
+                                  in_use);
+        }
         void* data_ptr = alloc_result->ptr();
         if (config_.use_uring) {
             data_ptr =

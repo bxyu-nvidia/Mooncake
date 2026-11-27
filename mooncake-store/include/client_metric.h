@@ -1,4 +1,6 @@
 #pragma once
+#include "offload_metrics.h"
+#include <memory>
 
 #include <algorithm>
 #include <array>
@@ -504,6 +506,8 @@ inline const std::vector<double> kSsdLatencyBucket = {
 };
 
 struct SsdMetric {
+    std::shared_ptr<OffloadMetrics> offload =
+        std::make_shared<OffloadMetrics>();
     SsdMetric(std::map<std::string, std::string> labels = {})
         : ssd_read_bytes("mooncake_ssd_read_bytes_total",
                          "Total bytes read from SSD", labels),
@@ -554,6 +558,7 @@ struct SsdMetric {
     std::chrono::steady_clock::time_point start_time_;
 
     void serialize(std::string& str) {
+        offload->Serialize(str);
         ssd_read_bytes.serialize(str);
         ssd_write_bytes.serialize(str);
         ssd_read_ops.serialize(str);

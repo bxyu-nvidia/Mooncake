@@ -103,13 +103,27 @@ class FileStorage {
         uint64_t total_size;
 
         AllocatedBatch() : batch_id(0), total_size(0) {}
-        AllocatedBatch(AllocatedBatch&&) = default;
-        AllocatedBatch& operator=(AllocatedBatch&&) = default;
+        AllocatedBatch(AllocatedBatch&&) = delete;
+        AllocatedBatch& operator=(AllocatedBatch&&) = delete;
 
         AllocatedBatch(const AllocatedBatch&) = delete;
         AllocatedBatch& operator=(const AllocatedBatch&) = delete;
 
-        ~AllocatedBatch() = default;
+        std::shared_ptr<OffloadMetrics> metrics;
+        int64_t allocated_bytes = 0;
+        int64_t allocated_at_us = 0;
+        ~AllocatedBatch() {
+            handles.clear();
+            if (metrics) {
+                metrics->AddGauge(
+                    OffloadMetrics::Gauge::read_buffer_in_use_bytes,
+                    -allocated_bytes);
+                metrics->AddGauge(OffloadMetrics::Gauge::read_buffer_batches,
+                                  -1);
+                metrics->Observe(OffloadMetrics::Phase::read_buffer_lifetime,
+                                 OffloadMetrics::NowUs() - allocated_at_us);
+            }
+        }
     };
 
     /**
@@ -200,6 +214,7 @@ class FileStorage {
 
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
+    std::shared_ptr<OffloadMetrics> offload_metrics_;
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
