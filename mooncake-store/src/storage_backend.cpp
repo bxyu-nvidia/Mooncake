@@ -61,6 +61,16 @@ namespace mooncake {
 
 namespace {
 
+// Keep close timing on every exit, including failed writes. Only write-mode
+// bucket handles use this deleter; cached read handles retain their lifetime.
+struct OffloadWriteFileDeleter {
+    OffloadMetrics* metrics;
+    void operator()(StorageFile* file) const {
+        OffloadTimer timer(metrics, OffloadMetrics::Phase::offload_write_close);
+        delete file;
+    }
+};
+
 struct OffsetAllocatorBackendEnvironmentVariables {
     inline static constexpr EnvironmentVariable<std::string>
         kMooncakeOffsetEvictionPolicy{"MOONCAKE_OFFSET_EVICTION_POLICY"};
@@ -1835,7 +1845,12 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // WriteBucket has closed its files. Account actual allocated blocks on
     // success AND failure (partial data/metadata may remain), before releasing
     // the physical reservation.
-    RefreshBucketDiskUsage(bucket_id);
+    {
+        OffloadTimer accounting_timer(
+            offload_metrics_.get(),
+            OffloadMetrics::Phase::offload_write_accounting);
+        RefreshBucketDiskUsage(bucket_id);
+    }
     write_timer.Stop();
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
@@ -2648,13 +2663,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto bucket_data_path = bucket_data_path_res.value();
+    OffloadTimer open_timer(offload_metrics_.get(),
+                            OffloadMetrics::Phase::offload_write_open);
     auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
+    open_timer.Stop();
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for bucket writing: "
                    << bucket_data_path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    auto file = std::move(open_file_result.value());
+    std::unique_ptr<StorageFile, OffloadWriteFileDeleter> file(
+        open_file_result.value().release(), {offload_metrics_.get()});
 
 #ifdef USE_URING
     // Try to use write_aligned for O_DIRECT I/O if file is UringFile
@@ -2736,7 +2755,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 #endif
     {
         // Fallback to vector_write for non-UringFile
+        OffloadTimer data_timer(offload_metrics_.get(),
+                                OffloadMetrics::Phase::offload_write_pwritev);
         auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
+        data_timer.Stop();
+        if (offload_metrics_ && write_result) {
+            // Count bytes accepted by pwritev, including a short write. This
+            // measures filesystem ingestion, not physical SSD writeback.
+            offload_metrics_->Add(
+                OffloadMetrics::Counter::offload_write_pwritev_bytes,
+                write_result.value());
+        }
         if (!write_result) {
             LOG(ERROR) << "vector_write failed for: " << bucket_id
                        << ", error: " << write_result.error();
@@ -3637,15 +3666,28 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto meta_path = meta_path_res.value();
+    OffloadTimer open_timer(offload_metrics_.get(),
+                            OffloadMetrics::Phase::offload_write_open);
     auto open_file_result = OpenFile(meta_path, FileMode::Write);
+    open_timer.Stop();
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    auto file = std::move(open_file_result.value());
+    std::unique_ptr<StorageFile, OffloadWriteFileDeleter> file(
+        open_file_result.value().release(), {offload_metrics_.get()});
+    // Include serialization but exclude the separately timed open and close.
+    OffloadTimer metadata_timer(offload_metrics_.get(),
+                                OffloadMetrics::Phase::offload_write_metadata);
     std::string str;
     struct_pb::to_pb(*metadata, str);
     auto write_result = file->write(str, str.size());
+    metadata_timer.Stop();
+    if (offload_metrics_ && write_result) {
+        offload_metrics_->Add(
+            OffloadMetrics::Counter::offload_write_metadata_bytes,
+            write_result.value());
+    }
     if (!write_result) {
         LOG(ERROR) << "Write failed for: " << meta_path
                    << ", error: " << write_result.error();

@@ -3304,6 +3304,110 @@ TEST_F(StorageBackendTest,
     EXPECT_EQ(notified_keys, expected_keys);
 }
 
+// Read the exported values to cover the names consumed by metrics scrapers.
+static int64_t WriteMetric(const OffloadMetrics& metrics,
+                           const std::string& suffix) {
+    std::string output;
+    metrics.Serialize(output);
+    const auto name = "\nmooncake_offload_write_" + suffix + " ";
+    const auto pos = output.find(name);
+    EXPECT_NE(pos, std::string::npos) << name;
+    return pos == std::string::npos
+               ? -1
+               : std::stoll(output.substr(pos + name.size()));
+}
+
+TEST_F(StorageBackendTest, BucketWritePhaseMetricsPreserveDataAndExcludeReads) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_physical_bytes = 1024 * 1024;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    std::string key = "timed_key";
+    std::string value(8192, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {key, {{value.data(), value.size()}}}};
+    auto result = backend.BatchOffload(batch, nullptr);
+    ASSERT_TRUE(result);
+    const auto& metrics = *backend.offload_metrics_;
+    EXPECT_EQ(WriteMetric(metrics, "operations_total"), 1);
+    EXPECT_EQ(WriteMetric(metrics, "open_operations_total"), 2);
+    EXPECT_EQ(WriteMetric(metrics, "close_operations_total"), 2);
+    int64_t component_us = 0;
+    for (const auto* phase : {"pwritev", "metadata", "accounting"}) {
+        EXPECT_EQ(
+            WriteMetric(metrics, std::string(phase) + "_operations_total"), 1);
+        component_us +=
+            WriteMetric(metrics, std::string(phase) + "_duration_us_total");
+    }
+    for (const auto* phase : {"open", "close"}) {
+        component_us +=
+            WriteMetric(metrics, std::string(phase) + "_duration_us_total");
+    }
+    EXPECT_GE(WriteMetric(metrics, "duration_us_total"), component_us);
+    EXPECT_EQ(WriteMetric(metrics, "pwritev_bytes_total"),
+              key.size() + value.size());
+    EXPECT_EQ(WriteMetric(metrics, "metadata_bytes_total"),
+              fs::file_size(fs::path(data_path) /
+                            (std::to_string(*result) + ".meta")));
+
+    std::string before_read;
+    metrics.Serialize(before_read);
+    std::string loaded(value.size(), '\0');
+    std::unordered_map<std::string, Slice> slices{
+        {key, {loaded.data(), loaded.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(slices));
+    EXPECT_EQ(loaded, value);
+    std::string after_read;
+    metrics.Serialize(after_read);
+    EXPECT_EQ(before_read, after_read);
+    EXPECT_EQ(after_read.find(" histogram\n"), std::string::npos);
+    EXPECT_EQ(after_read.find(" summary\n"), std::string::npos);
+}
+
+TEST_F(StorageBackendTest, BucketWritePhaseMetricsIncludeFailedFileOpens) {
+    for (const auto* extension : {".bucket", ".meta"}) {
+        SCOPED_TRACE(extension);
+        FileStorageConfig config;
+        config.storage_filepath = (fs::path(data_path) / extension).string();
+        fs::create_directories(config.storage_filepath);
+        BucketBackendConfig buckets;
+        buckets.max_physical_bytes = 1024 * 1024;
+        BucketStorageBackend backend(config, buckets);
+        ASSERT_TRUE(backend.Init());
+        std::string value(8192, 'x');
+        std::unordered_map<std::string, std::vector<Slice>> seed{
+            {"seed", {{value.data(), value.size()}}}};
+        auto first = backend.BatchOffload(seed, nullptr);
+        ASSERT_TRUE(first);
+        // A directory makes opening the next data/metadata file fail, even
+        // when the test runs as root. No storage or clock mocks are needed.
+        fs::create_directory(fs::path(config.storage_filepath) /
+                             (std::to_string(*first + 1) + extension));
+        backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"failed", {{value.data(), value.size()}}}};
+        EXPECT_FALSE(backend.BatchOffload(batch, nullptr));
+        EXPECT_FALSE(backend.IsExist("failed").value());
+        const auto& metrics = *backend.offload_metrics_;
+        const bool data_written = std::string_view(extension) == ".meta";
+        EXPECT_EQ(WriteMetric(metrics, "operations_total"), 1);
+        EXPECT_EQ(WriteMetric(metrics, "open_operations_total"),
+                  data_written ? 2 : 1);
+        EXPECT_EQ(WriteMetric(metrics, "close_operations_total"),
+                  data_written ? 1 : 0);
+        EXPECT_EQ(WriteMetric(metrics, "pwritev_operations_total"),
+                  data_written ? 1 : 0);
+        EXPECT_EQ(WriteMetric(metrics, "pwritev_bytes_total"),
+                  data_written ? value.size() + 6 : 0);
+        EXPECT_EQ(WriteMetric(metrics, "metadata_operations_total"), 0);
+        EXPECT_EQ(WriteMetric(metrics, "metadata_bytes_total"), 0);
+        EXPECT_EQ(WriteMetric(metrics, "accounting_operations_total"), 1);
+    }
+}
+
 TEST_F(StorageBackendTest, BucketPhysicalAccountingSurvivesReactiveEviction) {
     FileStorageConfig config;
     config.storage_filepath = data_path;

@@ -23,18 +23,20 @@ class OffloadMetrics {
                    std::chrono::steady_clock::now().time_since_epoch())
             .count();
     }
-#define OFFLOAD_COUNTERS(X)                                                \
-    X(eviction_passes)                                                     \
-    X(eviction_watermark_passes) X(eviction_write_checks)                  \
-        X(eviction_stop_target) X(eviction_stop_bucket_limit)              \
-            X(eviction_stop_no_candidates) X(eviction_errors)              \
-                X(eviction_selected_buckets) X(eviction_deleted_buckets)   \
-                    X(eviction_deleted_bytes) X(eviction_cleanup_failures) \
-                        X(read_buffer_allocation_failures)                 \
-                            X(read_buffer_requested_bytes)                 \
-                                X(read_buffer_requests)                    \
-                                    X(offload_received_objects)            \
-                                        X(offload_received_bytes)
+#define OFFLOAD_COUNTERS(X)                                                    \
+    X(eviction_passes)                                                         \
+    X(eviction_watermark_passes)                                               \
+    X(eviction_write_checks) X(eviction_stop_target)                           \
+        X(eviction_stop_bucket_limit) X(eviction_stop_no_candidates)           \
+            X(eviction_errors) X(eviction_selected_buckets)                    \
+                X(eviction_deleted_buckets) X(eviction_deleted_bytes)          \
+                    X(eviction_cleanup_failures) X(                            \
+                        read_buffer_allocation_failures)                       \
+                        X(read_buffer_requested_bytes) X(read_buffer_requests) \
+                            X(offload_received_objects)                        \
+                                X(offload_received_bytes)                      \
+                                    X(offload_write_pwritev_bytes)             \
+                                        X(offload_write_metadata_bytes)
 #define OFFLOAD_GAUGES(X)                                                 \
     X(disk_logical_bytes)                                                 \
     X(disk_quota_bytes) X(disk_high_watermark_bytes)                      \
@@ -44,14 +46,17 @@ class OffloadMetrics {
                     X(read_buffer_batches) X(read_buffer_peak_bytes)      \
                         X(offload_batch_remaining_bytes)                  \
                             X(offload_batch_remaining_objects)
-#define OFFLOAD_PHASES(X)                                                 \
-    X(eviction_trigger_delay)                                             \
-    X(eviction_pass) X(eviction_prepare) X(eviction_lock_wait)            \
-        X(eviction_lock_hold) X(eviction_select) X(disk_scan)             \
-            X(eviction_notify) X(eviction_reader_wait) X(eviction_delete) \
-                X(heartbeat) X(heartbeat_rpc) X(offload_batch)            \
-                    X(offload_staging) X(offload_write) X(offload_ack)    \
-                        X(read_buffer_lifetime)
+#define OFFLOAD_PHASES(X)                                                   \
+    X(eviction_trigger_delay)                                               \
+    X(eviction_pass)                                                        \
+    X(eviction_prepare) X(eviction_lock_wait) X(eviction_lock_hold)         \
+        X(eviction_select) X(disk_scan) X(eviction_notify)                  \
+            X(eviction_reader_wait) X(eviction_delete) X(heartbeat)         \
+                X(heartbeat_rpc) X(offload_batch) X(offload_staging)        \
+                    X(offload_write) X(offload_ack) X(read_buffer_lifetime) \
+                        X(offload_write_pwritev) X(offload_write_metadata)  \
+                            X(offload_write_open) X(offload_write_close)    \
+                                X(offload_write_accounting)
 #define ENUM_VALUE(name) name,
     enum class Counter { OFFLOAD_COUNTERS(ENUM_VALUE) size };
     enum class Gauge { OFFLOAD_GAUGES(ENUM_VALUE) size };
