@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstdint>
@@ -1771,7 +1772,19 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     OffloadTimer pass_timer(offload_metrics_.get(),
                             OffloadMetrics::Phase::eviction_pass);
     const int64_t required_size = bucket->data_size + bucket->meta_size;
-    auto prepare_result = PrepareEviction(required_size, bucket->keys);
+    // Reserve both files, including allocation rounding, before starting I/O.
+    // meta_size is populated only by StoreBucketMetadata, so serialize the
+    // small metadata record here to size its reservation accurately.
+    int64_t physical_write_size = 0;
+    if (bucket_backend_config_.max_physical_bytes > 0) {
+        std::string encoded_metadata;
+        struct_pb::to_pb(*bucket, encoded_metadata);
+        physical_write_size =
+            align_up(bucket->data_size, physical_block_size_) +
+            align_up(encoded_metadata.size(), physical_block_size_);
+    }
+    auto prepare_result =
+        PrepareEviction(required_size, bucket->keys, physical_write_size);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
     }
@@ -1795,14 +1808,34 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     if (!finalize_result) {
         LOG(ERROR)
             << "FinalizeEviction failed after master committed eviction; "
-               "continuing BatchOffload: "
+               "checking capacity before continuing BatchOffload: "
             << finalize_result.error();
+    }
+
+    // Selection only projected reclaimed space. Failed unlinks or readers
+    // retaining files must not turn that projection into write permission.
+    if (bucket_backend_config_.max_physical_bytes > 0) {
+        SharedMutexLocker lock(&mutex_);
+        const auto used = disk_usage_.Bytes();
+        if (!used || *used + pending_physical_write_size_ >
+                         bucket_backend_config_.max_physical_bytes) {
+            LOG(WARNING) << "Bucket write rejected after eviction: physical="
+                         << used.value_or(-1) << " reserved="
+                         << pending_physical_write_size_ << " cap="
+                         << bucket_backend_config_.max_physical_bytes;
+            ReleasePreparedWriteLocked(pending);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
     }
 
     pass_timer.Stop();
     OffloadTimer write_timer(offload_metrics_.get(),
                              OffloadMetrics::Phase::offload_write);
     auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
+    // WriteBucket has closed its files. Account actual allocated blocks on
+    // success AND failure (partial data/metadata may remain), before releasing
+    // the physical reservation.
+    RefreshBucketDiskUsage(bucket_id);
     write_timer.Stop();
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
@@ -2329,6 +2362,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                       << bucket_backend_config_.max_total_size << " bytes";
         }
 
+        if (bucket_backend_config_.max_physical_bytes > 0) {
+            struct statvfs info;
+            if (::statvfs(storage_path_.c_str(), &info) == 0) {
+                physical_block_size_ = std::max<int64_t>(4096, info.f_frsize);
+            }
+            auto error = disk_usage_.Reconcile(storage_path_,
+                                               std::chrono::milliseconds(0),
+                                               offload_metrics_.get());
+            if (error) {
+                LOG(ERROR) << "Cannot establish bucket disk usage: "
+                           << error.message();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+        }
         bucket_id_generator_.emplace(max_bucket_id);
         if (max_bucket_id == BucketIdGenerator::INIT_NEW_START_ID) {
             LOG(INFO) << "Initialized BucketIdGenerator with fresh start. "
@@ -2595,7 +2642,6 @@ BucketStorageBackend::BuildBucket(
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
-    namespace fs = std::filesystem;
     auto bucket_data_path_res = GetBucketDataPath(bucket_id);
     if (!bucket_data_path_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
@@ -2718,7 +2764,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 
         // Clean up the bucket file to prevent orphans
         std::error_code ec;
-        if (fs::remove(bucket_data_path, ec)) {
+        if (RemoveBucketFile(bucket_data_path, ec)) {
             LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
                             "write failure: "
                          << bucket_data_path;
@@ -2734,7 +2780,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 }
 
 void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
-    namespace fs = std::filesystem;
     std::error_code ec;
 
     auto data_path_res = GetBucketDataPath(bucket_id);
@@ -2747,7 +2792,7 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
             MutexLocker cache_locker(&file_cache_mutex_);
             file_cache_.erase(data_path_res.value());
         }
-        if (fs::remove(data_path_res.value(), ec)) {
+        if (RemoveBucketFile(data_path_res.value(), ec)) {
             LOG(INFO) << "Cleaned up orphaned bucket data file: "
                       << data_path_res.value();
         } else if (ec && ec != std::errc::no_such_file_or_directory) {
@@ -2760,7 +2805,7 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
     auto meta_path_res = GetBucketMetadataPath(bucket_id);
     if (meta_path_res) {
         ec.clear();
-        if (fs::remove(meta_path_res.value(), ec)) {
+        if (RemoveBucketFile(meta_path_res.value(), ec)) {
             LOG(INFO) << "Cleaned up orphaned bucket metadata file: "
                       << meta_path_res.value();
         } else if (ec && ec != std::errc::no_such_file_or_directory) {
@@ -2912,61 +2957,52 @@ BucketStorageBackend::SelectEvictionCandidate() {
     }
 }
 
-int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
-    namespace fs = std::filesystem;
-    auto now = std::chrono::steady_clock::now();
-    if (cached_disk_bytes_ >= 0 &&
-        now - cached_disk_bytes_at_ <
-            std::chrono::milliseconds(
-                bucket_backend_config_.disk_scan_cache_ms)) {
-        return cached_disk_bytes_;
-    }
-    OffloadTimer scan_timer(offload_metrics_.get(),
-                            OffloadMetrics::Phase::disk_scan);
-    int64_t total = 0;
-    std::error_code ec;
-    // Recursive scan: matches Init()'s recursive_directory_iterator and the
-    // du/kubelet accounting basis (the whole subtree, not just top-level
-    // entries), so nested content can never be silently missed.
-    fs::recursive_directory_iterator it(storage_path_, ec), end;
-    if (ec) {
-        // Cannot even open storage_path_. This is a hard safety cap, so fail
-        // CLOSED: report the cap as reached so eviction/rejection engages
-        // instead of letting the disk overflow, and do NOT cache the result
-        // (next call re-scans once the directory is readable again).
-        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
-                     << storage_path_ << ": " << ec.message()
-                     << ", failing closed";
-        return bucket_backend_config_.max_physical_bytes;
-    }
-    for (; it != end; it.increment(ec)) {
-        if (ec) {
-            // Iteration errored partway. Returning the partial total would
-            // under-count and silently open the cap; fail closed and skip
-            // caching so the next call re-scans.
-            LOG(WARNING) << "[Bucket] physcap disk scan error under "
-                         << storage_path_ << ": " << ec.message()
-                         << ", failing closed";
-            return bucket_backend_config_.max_physical_bytes;
-        }
-        struct stat st;
-        // st_blocks counts 512-byte blocks actually allocated on disk — the
-        // same basis as du / kubelet's emptyDir accounting (handles block
-        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
-        // file concurrently deleted during eviction) is skipped best-effort:
-        // that only under-counts by ~one file and avoids spurious fail-closed.
-        if (::stat(it->path().c_str(), &st) == 0) {
-            total += static_cast<int64_t>(st.st_blocks) * 512;
+void BucketStorageBackend::RefreshBucketDiskUsage(int64_t bucket_id) {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return;
+    for (const auto& path :
+         {GetBucketDataPath(bucket_id), GetBucketMetadataPath(bucket_id)}) {
+        if (path) {
+            const auto error = disk_usage_.RefreshFile(*path);
+            if (error) {
+                LOG(ERROR) << "Cannot account bucket file " << *path << ": "
+                           << error.message();
+            }
         }
     }
-    cached_disk_bytes_ = total;
-    cached_disk_bytes_at_ = now;
-    return total;
+}
+
+bool BucketStorageBackend::RemoveBucketFile(const std::string& path,
+                                            std::error_code& error) {
+    const bool removed = std::filesystem::remove(path, error);
+    if (bucket_backend_config_.max_physical_bytes > 0) {
+        // Stat even when unlink fails: retain its allocation until it is really
+        // gone. This also records a tombstone for a concurrent reconciliation.
+        const auto account_error = disk_usage_.RefreshFile(path);
+        if (account_error) {
+            LOG(ERROR) << "Cannot account bucket deletion " << path << ": "
+                       << account_error.message();
+        }
+    }
+    return removed;
 }
 
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
-    int64_t required_size, const std::vector<std::string>& write_keys) {
+    int64_t required_size, const std::vector<std::string>& write_keys,
+    int64_t physical_write_size) {
+    // Reconciliation can traverse a large directory. It must not hold mutex_,
+    // which also protects reads and ordinary bucket metadata operations.
+    if (bucket_backend_config_.max_physical_bytes > 0) {
+        auto error = disk_usage_.Reconcile(
+            storage_path_,
+            std::chrono::milliseconds(
+                bucket_backend_config_.disk_scan_cache_ms),
+            offload_metrics_.get());
+        if (error) {
+            LOG(WARNING) << "Bucket disk reconciliation failed: "
+                         << error.message();
+        }
+    }
     PendingEviction result;
     OffloadTimer wait_timer(offload_metrics_.get(),
                             OffloadMetrics::Phase::eviction_lock_wait);
@@ -2996,11 +3032,14 @@ BucketStorageBackend::PrepareEviction(
         }
         result.write_keys = write_keys;
         result.write_size = required_size;
+        result.physical_write_size = physical_write_size;
         pending_write_size_ += required_size;
+        pending_physical_write_size_ += physical_write_size;
         pending_write_keys_.insert(write_keys.begin(), write_keys.end());
     }
 
-    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE &&
+        bucket_backend_config_.max_physical_bytes <= 0) {
         return result;
     }
 
@@ -3047,36 +3086,27 @@ BucketStorageBackend::PrepareEviction(
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
         write_keys.empty() ? required_size : 0;
-    // On-disk footprint of the incoming write (~required_size); 0 for
-    // watermark-driven eviction, which has no incoming write. Added to the
-    // physical check below so we free enough room for THIS write, not merely
-    // enough to bring current usage back under the cap.
-    const int64_t incoming_physical_size =
-        write_keys.empty() ? 0 : required_size;
-
-    // Ground-truth physical usage of the offload directory (cached),
-    // snapshotted once. As buckets are selected for eviction their files get
-    // deleted in the later FinalizeEviction, so (physical_used_start -
-    // accumulated_freed_space) projects the physical bytes that will remain
-    // after this round.
-    const int64_t physical_used_start =
-        bucket_backend_config_.max_physical_bytes > 0
-            ? ActualDiskBytesUsedLocked()
-            : 0;
-    // True when the projected physical usage after this round — real disk usage
-    // minus what we free here, plus the incoming write — would still exceed the
-    // physical cap. Shared by the in-loop "keep evicting" test and the
-    // post-loop "reject the write" test.
-    const auto phys_over_cap = [&](uint64_t freed) {
+    // Include every outstanding write reservation. During a write's final
+    // accounting/commit window some bytes may be counted twice, conservatively.
+    const auto physical_used = disk_usage_.Bytes();
+    if (bucket_backend_config_.max_physical_bytes > 0 && !physical_used) {
+        ReleasePreparedWriteLocked(result);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    const int64_t physical_used_start = physical_used.value_or(0);
+    uint64_t physical_freed = 0;
+    const auto phys_over_cap = [&]() {
         return bucket_backend_config_.max_physical_bytes > 0 &&
-               physical_used_start + incoming_physical_size -
-                       static_cast<int64_t>(freed) >
+               physical_used_start + pending_physical_write_size_ -
+                       static_cast<int64_t>(physical_freed) >
                    bucket_backend_config_.max_physical_bytes;
     };
 
     OffloadTimer select_timer(offload_metrics_.get(),
                               OffloadMetrics::Phase::eviction_select);
-    while (!buckets_.empty() && evict_count < kMaxEvictionBuckets) {
+    while (bucket_backend_config_.eviction_policy !=
+               BucketEvictionPolicy::NONE &&
+           !buckets_.empty() && evict_count < kMaxEvictionBuckets) {
         bool quota_exceeded = total_size_ + pending_eviction_size_ +
                                   pending_write_size_ +
                                   synthetic_required_size >
@@ -3088,7 +3118,7 @@ BucketStorageBackend::PrepareEviction(
         // Physical hard cap on real on-disk usage (not total_size_, which
         // under-counts lingering bucket files, and not fs::space(), which is
         // blind to cgroup/emptyDir quotas).
-        bool phys_exceeded = phys_over_cap(accumulated_freed_space);
+        bool phys_exceeded = phys_over_cap();
 
         if (!quota_exceeded && !disk_still_full && !phys_exceeded) break;
 
@@ -3133,6 +3163,12 @@ BucketStorageBackend::PrepareEviction(
         accumulated_freed_space +=
             static_cast<uint64_t>(evict_meta->data_size) +
             static_cast<uint64_t>(evict_meta->meta_size);
+        if (bucket_backend_config_.max_physical_bytes > 0) {
+            for (const auto& path : {GetBucketDataPath(evict_id),
+                                     GetBucketMetadataPath(evict_id)}) {
+                if (path) physical_freed += disk_usage_.FileBytes(*path);
+            }
+        }
         result.buckets.emplace_back(evict_id, std::move(evict_meta));
         evict_count++;
     }
@@ -3145,7 +3181,7 @@ BucketStorageBackend::PrepareEviction(
     // Physical cap still exceeded after evicting up to kMaxEvictionBuckets:
     // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
     // rather than overrun the disk quota and get OOM-evicted.
-    const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
+    const bool phys_exceeded = phys_over_cap();
     if (offload_metrics_) {
         const bool reached =
             !quota_exceeded && !phys_exceeded &&
@@ -3246,6 +3282,8 @@ void BucketStorageBackend::ReleasePreparedWriteLocked(
     const PendingEviction& pending) {
     CHECK_GE(pending_write_size_, pending.write_size);
     pending_write_size_ -= pending.write_size;
+    CHECK_GE(pending_physical_write_size_, pending.physical_write_size);
+    pending_physical_write_size_ -= pending.physical_write_size;
     for (const auto& key : pending.write_keys) {
         pending_write_keys_.erase(key);
     }
@@ -3253,7 +3291,6 @@ void BucketStorageBackend::ReleasePreparedWriteLocked(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     const PendingEviction& pending) {
-    namespace fs = std::filesystem;
 
     constexpr int kMaxSpinIterations = 1000;
     constexpr auto kMaxWaitTime = std::chrono::seconds(10);
@@ -3271,7 +3308,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
                                        OffloadMetrics::Phase::eviction_delete);
         auto meta_path = GetBucketMetadataPath(bucket_id);
         if (meta_path) {
-            fs::remove(meta_path.value(), ec);
+            RemoveBucketFile(meta_path.value(), ec);
             if (ec && ec != std::errc::no_such_file_or_directory) {
                 LOG(ERROR)
                     << "FinalizeEviction: failed to remove metadata file: "
@@ -3327,7 +3364,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
                 MutexLocker cache_locker(&file_cache_mutex_);
                 file_cache_.erase(data_path.value());
             }
-            data_removed = fs::remove(data_path.value(), ec);
+            data_removed = RemoveBucketFile(data_path.value(), ec);
             if (ec && ec != std::errc::no_such_file_or_directory) {
                 // File remains on disk as an orphan; disk space is not freed.
                 // WriteBucket may then fail with ENOSPC. Orphan will be cleaned
@@ -3356,12 +3393,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
                   << " cleanup_failed=" << cleanup_failed_count;
-        // Files were just deleted; force the next physical-usage query to
-        // rescan rather than return the now-stale (higher) cached value.
-        {
-            SharedMutexLocker lock(&mutex_);
-            cached_disk_bytes_ = -1;
-        }
     }
     if (offload_metrics_)
         offload_metrics_->Add(
@@ -3445,7 +3476,6 @@ BucketStorageBackend::EvictAboveDiskWatermark(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     int64_t bucket_id) {
-    namespace fs = std::filesystem;
     std::shared_ptr<BucketMetadata> bucket_metadata;
     std::vector<std::string> keys_to_remove;
 
@@ -3519,7 +3549,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
     auto data_path_res = GetBucketDataPath(bucket_id);
     if (data_path_res) {
-        fs::remove(data_path_res.value(), ec);
+        RemoveBucketFile(data_path_res.value(), ec);
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(WARNING) << "DeleteBucket: failed to remove data file: "
                          << data_path_res.value()
@@ -3530,7 +3560,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     auto meta_path_res = GetBucketMetadataPath(bucket_id);
     if (meta_path_res) {
         ec.clear();
-        fs::remove(meta_path_res.value(), ec);
+        RemoveBucketFile(meta_path_res.value(), ec);
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(WARNING) << "DeleteBucket: failed to remove metadata file: "
                          << meta_path_res.value()

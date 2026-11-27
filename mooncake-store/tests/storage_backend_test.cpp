@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -3286,6 +3287,134 @@ TEST_F(StorageBackendTest,
                                               "restart_key_3"};
     EXPECT_EQ(returned_keys, expected_keys);
     EXPECT_EQ(notified_keys, expected_keys);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalAccountingSurvivesReactiveEviction) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 1024 * 1024;
+    buckets.max_physical_bytes = 32 * 1024;
+    buckets.disk_scan_cache_ms = 3600000;
+    buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    std::string value(8192, 'x');
+    for (int i = 0; i < 20; ++i) {
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"physical_" + std::to_string(i), {{value.data(), value.size()}}}};
+        ASSERT_TRUE(backend.BatchOffload(batch, nullptr));
+        int64_t allocated = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(data_path)) {
+            struct stat st{};
+            ASSERT_EQ(::stat(entry.path().c_str(), &st), 0);
+            allocated += st.st_blocks * 512;
+        }
+        EXPECT_LE(allocated, buckets.max_physical_bytes);
+    }
+    EXPECT_FALSE(backend.IsExist("physical_0").value());
+    EXPECT_TRUE(backend.IsExist("physical_19").value());
+    std::string metrics;
+    backend.offload_metrics_->Serialize(metrics);
+    EXPECT_NE(
+        metrics.find("mooncake_offload_disk_scan_operations_total 1.000000\n"),
+        std::string::npos);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalCapReservesRoundedDataAndMetadata) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 1024 * 1024;
+    buckets.max_physical_bytes = 8192;
+    buckets.disk_scan_cache_ms = 3600000;
+    buckets.eviction_policy = BucketEvictionPolicy::NONE;
+    BucketStorageBackend backend(config, buckets);
+    ASSERT_TRUE(backend.Init());
+    std::string value(8192, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> large{
+        {"large", {{value.data(), value.size()}}}};
+    auto result = backend.BatchOffload(large, nullptr);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_TRUE(fs::is_empty(data_path));
+    // Rejection releases the reservation, allowing a smaller write to fit.
+    std::unordered_map<std::string, std::vector<Slice>> small{
+        {"small", {{value.data(), 1}}}};
+    ASSERT_TRUE(backend.BatchOffload(small, nullptr));
+    std::unordered_map<std::string, std::vector<Slice>> extra{
+        {"extra", {{value.data(), 1}}}};
+    EXPECT_FALSE(backend.BatchOffload(extra, nullptr));
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalCapIncludesOtherPendingWrites) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 1024 * 1024;
+    buckets.max_physical_bytes = 24 * 1024;
+    buckets.disk_scan_cache_ms = 3600000;
+    buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, buckets);
+    ASSERT_TRUE(backend.Init());
+    std::string value(8192, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> old{
+        {"old", {{value.data(), value.size()}}}};
+    ASSERT_TRUE(backend.BatchOffload(old, nullptr));
+    std::unordered_map<std::string, std::vector<Slice>> outer{
+        {"outer", {{value.data(), value.size()}}}};
+    std::unordered_map<std::string, std::vector<Slice>> nested{
+        {"nested", {{value.data(), 1}}}};
+    bool notified = false;
+    auto result = backend.BatchOffload(
+        outer, nullptr,
+        [&](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            notified = true;
+            // The outer write has reserved 16 KiB. The selected old bucket
+            // still occupies 16 KiB until this callback acknowledges eviction.
+            auto inner = backend.BatchOffload(nested, nullptr);
+            EXPECT_FALSE(inner);
+            if (!inner) EXPECT_EQ(inner.error(), ErrorCode::FILE_WRITE_FAIL);
+            return {};
+        });
+    ASSERT_TRUE(result);
+    EXPECT_TRUE(notified);
+    EXPECT_TRUE(backend.IsExist("outer").value());
+    EXPECT_FALSE(backend.IsExist("nested").value());
+}
+
+TEST_F(StorageBackendTest,
+       BucketPhysicalAccountingReleasesRollbackAndRemoveAll) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 1024 * 1024;
+    buckets.max_physical_bytes = 16 * 1024;
+    buckets.disk_scan_cache_ms = 3600000;
+    buckets.eviction_policy = BucketEvictionPolicy::NONE;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    std::string value(8192, 'x');
+    for (int i = 0; i < 3; ++i) {
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"rollback", {{value.data(), value.size()}}}};
+        auto failed = backend.BatchOffload(batch, [](const auto&, auto&) {
+            return ErrorCode::INTERNAL_ERROR;
+        });
+        ASSERT_FALSE(failed);
+        EXPECT_EQ(failed.error(), ErrorCode::INTERNAL_ERROR);
+        EXPECT_TRUE(fs::is_empty(data_path));
+        ASSERT_TRUE(backend.BatchOffload(batch, nullptr));
+        backend.RemoveAll();
+        EXPECT_TRUE(fs::is_empty(data_path));
+    }
+    std::string metrics;
+    backend.offload_metrics_->Serialize(metrics);
+    EXPECT_NE(
+        metrics.find("mooncake_offload_disk_scan_operations_total 1.000000\n"),
+        std::string::npos);
 }
 
 TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
