@@ -88,6 +88,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
     storage_backend_ = create_storage_backend_result.value();
     storage_backend_->offload_metrics_ = offload_metrics_;
+    if (ssd_metric_)
+        ssd_metric_->system.SetStoragePath(config_.storage_filepath);
     if (offload_metrics_)
         offload_metrics_->Set(OffloadMetrics::Gauge::read_buffer_capacity_bytes,
                               client_buffer_allocator_->size() +

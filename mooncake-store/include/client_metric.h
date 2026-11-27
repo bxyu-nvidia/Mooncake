@@ -1,5 +1,6 @@
 #pragma once
 #include "offload_metrics.h"
+#include "offload_system_metrics.h"
 #include <memory>
 
 #include <algorithm>
@@ -506,6 +507,7 @@ inline const std::vector<double> kSsdLatencyBucket = {
 };
 
 struct SsdMetric {
+    OffloadSystemMetrics system;
     std::shared_ptr<OffloadMetrics> offload =
         std::make_shared<OffloadMetrics>();
     SsdMetric(std::map<std::string, std::string> labels = {})
@@ -559,6 +561,7 @@ struct SsdMetric {
 
     void serialize(std::string& str) {
         offload->Serialize(str);
+        system.Serialize(str);
         ssd_read_bytes.serialize(str);
         ssd_write_bytes.serialize(str);
         ssd_read_ops.serialize(str);
