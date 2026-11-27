@@ -2989,7 +2989,7 @@ bool BucketStorageBackend::RemoveBucketFile(const std::string& path,
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
     int64_t required_size, const std::vector<std::string>& write_keys,
-    int64_t physical_write_size) {
+    int64_t physical_write_size, bool avoid_readers) {
     // Reconciliation can traverse a large directory. It must not hold mutex_,
     // which also protects reads and ordinary bucket metadata operations.
     if (bucket_backend_config_.max_physical_bytes > 0) {
@@ -3133,6 +3133,22 @@ BucketStorageBackend::PrepareEviction(
 
         auto evict_it = SelectEvictionCandidate();
         if (evict_it == buckets_.end()) break;
+        // Proactive cleanup must yield to readers, not hold up an offload
+        // batch for the per-bucket reader timeout. New read guards require
+        // mutex_, so a zero-reader bucket cannot acquire a reader after this
+        // check and its removal from buckets_. Reactive writes retain their
+        // existing wait-for-readers behavior.
+        if (avoid_readers && evict_it->second->inflight_reads_.load(
+                                 std::memory_order_acquire) > 0) {
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::LRU) {
+                lru_index_.emplace(evict_it->second->last_access_ns_.load(
+                                       std::memory_order_relaxed),
+                                   evict_it->first);
+            }
+            result.readers_blocked = true;
+            break;
+        }
 
         int64_t evict_id = evict_it->first;
         std::shared_ptr<BucketMetadata> evict_meta =
@@ -3417,18 +3433,25 @@ BucketStorageBackend::EvictAboveDiskWatermark(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    int64_t total_size = 0;
-    int64_t max_total_size = bucket_backend_config_.max_total_size;
-    {
-        SharedMutexLocker lock(&mutex_, shared_lock);
-        total_size = total_size_;
-    }
-
+    const int64_t max_total_size = bucket_backend_config_.max_total_size;
     const auto high_watermark_bytes =
         static_cast<int64_t>(max_total_size * high_watermark_ratio);
-    if (total_size <= high_watermark_bytes) {
-        return evicted_keys;
+    const auto target_total_size =
+        static_cast<int64_t>(max_total_size * low_watermark_ratio);
+    {
+        SharedMutexLocker lock(&mutex_);
+        if (!disk_watermark_eviction_.Begin(
+                total_size_ + pending_eviction_size_, high_watermark_bytes,
+                target_total_size)) {
+            return evicted_keys;
+        }
     }
+    auto finish_pass = [&](bool made_progress, bool blocked) {
+        SharedMutexLocker lock(&mutex_);
+        disk_watermark_eviction_.Finish(total_size_ + pending_eviction_size_,
+                                        target_total_size, made_progress,
+                                        blocked);
+    };
 
     if (offload_metrics_) {
         offload_metrics_->Add(
@@ -3442,11 +3465,11 @@ BucketStorageBackend::EvictAboveDiskWatermark(
     }
     OffloadTimer pass_timer(offload_metrics_.get(),
                             OffloadMetrics::Phase::eviction_pass);
-    const auto target_total_size =
-        static_cast<int64_t>(max_total_size * low_watermark_ratio);
     const auto synthetic_required_size = max_total_size - target_total_size;
-    auto prepare_result = PrepareEviction(synthetic_required_size);
+    auto prepare_result = PrepareEviction(synthetic_required_size, {}, 0,
+                                          /*avoid_readers=*/true);
     if (!prepare_result) {
+        finish_pass(false, true);
         return tl::make_unexpected(prepare_result.error());
     }
     PendingEviction pending = std::move(prepare_result.value());
@@ -3460,6 +3483,7 @@ BucketStorageBackend::EvictAboveDiskWatermark(
             if (offload_metrics_)
                 offload_metrics_->Add(OffloadMetrics::Counter::eviction_errors);
             RestorePreparedEviction(std::move(pending));
+            finish_pass(false, true);
             return tl::make_unexpected(notify_result.error());
         }
     }
@@ -3471,7 +3495,15 @@ BucketStorageBackend::EvictAboveDiskWatermark(
                "returning evicted keys: "
             << finalize_result.error();
     }
+    finish_pass(!pending.buckets.empty(),
+                pending.readers_blocked || !finalize_result);
     return evicted_keys;
+}
+
+std::optional<std::chrono::milliseconds>
+BucketStorageBackend::DiskWatermarkEvictionRetryDelay() const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    return disk_watermark_eviction_.RetryDelay();
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(

@@ -100,6 +100,21 @@ class StorageBackendTest : public ::testing::Test {
    protected:
     std::string data_path;
 
+    static std::unique_ptr<BucketReadGuard> PinBucket(
+        BucketStorageBackend& backend, const std::string& key) {
+        SharedMutexLocker lock(&backend.mutex_, shared_lock);
+        const auto id = backend.object_bucket_map_.at(key).bucket_id;
+        return std::make_unique<BucketReadGuard>(backend.buckets_.at(id));
+    }
+
+    static std::string BucketPath(BucketStorageBackend& backend,
+                                  const std::string& key) {
+        SharedMutexLocker lock(&backend.mutex_, shared_lock);
+        return backend
+            .GetBucketDataPath(backend.object_bucket_map_.at(key).bucket_id)
+            .value();
+    }
+
     // Helper function to test partial success behavior for any
     // StorageBackendInterface. Uses deterministic failure injection on a batch
     // of keys to ensure that some writes succeed and exactly one write fails,
@@ -3928,6 +3943,13 @@ TEST_F(StorageBackendTest,
     ASSERT_TRUE(oldest_exists.has_value());
     EXPECT_TRUE(oldest_exists.value());
 
+    const auto retry = storage_backend.DiskWatermarkEvictionRetryDelay();
+    ASSERT_TRUE(retry.has_value());
+    auto skipped = storage_backend.EvictAboveDiskWatermark(0.50, 0.25);
+    ASSERT_TRUE(skipped);
+    EXPECT_TRUE(skipped->empty());
+    EXPECT_TRUE(storage_backend.IsExist("rollback_bucket_key_0").value());
+    std::this_thread::sleep_for(*retry);
     auto successful_evict = storage_backend.EvictAboveDiskWatermark(
         /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.25,
         [](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
@@ -3957,7 +3979,10 @@ TEST_F(StorageBackendTest,
             {"limited_" + std::to_string(i), {{payload, sizeof(payload)}}}};
         ASSERT_TRUE(backend.BatchOffload(batch, nullptr));
     }
-    auto first = backend.EvictAboveDiskWatermark(1e-8, 5e-9);
+    const auto before = backend.GetStoreMetadata();
+    ASSERT_TRUE(before);
+    const double high = 0.9 * before->total_size / buckets.max_total_size;
+    auto first = backend.EvictAboveDiskWatermark(high, 5e-9);
     ASSERT_TRUE(first);
     EXPECT_EQ(first->size(), 1000);
     EXPECT_EQ(backend.offload_metrics_->Get(
@@ -3969,15 +3994,108 @@ TEST_F(StorageBackendTest,
     EXPECT_GT(backend.offload_metrics_->Get(
                   OffloadMetrics::Gauge::disk_logical_bytes),
               0);
-    auto second = backend.EvictAboveDiskWatermark(1e-8, 5e-9);
+    const auto after = backend.GetStoreMetadata();
+    ASSERT_TRUE(after);
+    EXPECT_LT(after->total_size, high * buckets.max_total_size);
+    EXPECT_EQ(backend.DiskWatermarkEvictionRetryDelay(),
+              std::chrono::milliseconds(0));
+    // Still below high: the old implementation incorrectly stopped here.
+    auto second = backend.EvictAboveDiskWatermark(high, 5e-9);
     ASSERT_TRUE(second);
     EXPECT_EQ(second->size(), 1);
+    EXPECT_FALSE(backend.DiskWatermarkEvictionRetryDelay());
     EXPECT_EQ(backend.offload_metrics_->Get(
                   OffloadMetrics::Counter::eviction_deleted_bytes),
               8008);
     EXPECT_EQ(backend.offload_metrics_->Get(
                   OffloadMetrics::Gauge::disk_logical_bytes),
               0);
+}
+
+TEST_F(StorageBackendTest, BucketWatermarkEvictionYieldsToReaders) {
+    for (auto policy :
+         {BucketEvictionPolicy::FIFO, BucketEvictionPolicy::LRU}) {
+        FileStorageConfig config;
+        config.storage_filepath = data_path;
+        BucketBackendConfig buckets;
+        buckets.max_total_size = 30 * 1024;
+        buckets.eviction_policy = policy;
+        BucketStorageBackend backend(config, buckets);
+        ASSERT_TRUE(backend.Init());
+        std::string value(6 * 1024, 'x');
+        for (const auto& key : {"oldest", "newest"}) {
+            ASSERT_TRUE(backend.BatchOffload(
+                {{key, {{value.data(), value.size()}}}}, nullptr));
+        }
+        auto reader = PinBucket(backend, "oldest");
+        bool notified = false;
+        auto blocked = backend.EvictAboveDiskWatermark(
+            0.3, 0.15, [&](const auto&) -> tl::expected<void, ErrorCode> {
+                notified = true;
+                return {};
+            });
+        ASSERT_TRUE(blocked);
+        EXPECT_TRUE(blocked->empty());
+        EXPECT_FALSE(notified);
+        EXPECT_TRUE(backend.IsExist("oldest").value());
+        const auto retry = backend.DiskWatermarkEvictionRetryDelay();
+        ASSERT_TRUE(retry.has_value());
+        reader.reset();
+        std::this_thread::sleep_for(*retry);
+        auto evicted = backend.EvictAboveDiskWatermark(0.3, 0.15);
+        ASSERT_TRUE(evicted);
+        EXPECT_EQ(evicted->size(), 2);
+        EXPECT_FALSE(backend.DiskWatermarkEvictionRetryDelay());
+        backend.RemoveAll();
+    }
+}
+
+TEST_F(StorageBackendTest, BucketWatermarkEvictionBacksOffAfterCleanupFailure) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig buckets;
+    buckets.max_total_size = 30 * 1024;
+    buckets.eviction_policy = BucketEvictionPolicy::FIFO;
+    BucketStorageBackend backend(config, buckets);
+    backend.offload_metrics_ = std::make_shared<OffloadMetrics>();
+    ASSERT_TRUE(backend.Init());
+    std::string value(6 * 1024, 'x');
+    for (const auto& key : {"oldest", "middle", "newest"}) {
+        ASSERT_TRUE(backend.BatchOffload(
+            {{key, {{value.data(), value.size()}}}}, nullptr));
+    }
+    const auto path = BucketPath(backend, "oldest");
+    // Force unlink failure without depending on root/non-root permissions.
+    ASSERT_TRUE(fs::remove(path));
+    fs::create_directory(path);
+    std::ofstream(path + "/busy") << "x";
+    auto result = backend.EvictAboveDiskWatermark(
+        0.5, 0.25, [&](const auto&) -> tl::expected<void, ErrorCode> {
+            EXPECT_TRUE(fs::exists(path));  // Notification precedes deletion.
+            // A concurrent write keeps usage above low after this pass.
+            EXPECT_TRUE(backend.BatchOffload(
+                {{"concurrent", {{value.data(), value.size()}}}}, nullptr));
+            return {};
+        });
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->size(),
+              2);  // Master removals are committed despite error.
+    EXPECT_EQ(backend.offload_metrics_->Get(
+                  OffloadMetrics::Counter::eviction_cleanup_failures),
+              1);
+    EXPECT_TRUE(fs::exists(path));
+    EXPECT_FALSE(backend.IsExist("oldest").value());
+    const auto retry = backend.DiskWatermarkEvictionRetryDelay();
+    ASSERT_TRUE(retry.has_value());
+    auto skipped = backend.EvictAboveDiskWatermark(0.5, 0.25);
+    ASSERT_TRUE(skipped);
+    EXPECT_TRUE(skipped->empty());
+    EXPECT_TRUE(backend.IsExist("newest").value());
+    std::this_thread::sleep_for(*retry);
+    auto resumed = backend.EvictAboveDiskWatermark(0.5, 0.25);
+    ASSERT_TRUE(resumed);
+    EXPECT_EQ(resumed->size(), 1);
+    EXPECT_FALSE(backend.DiskWatermarkEvictionRetryDelay());
 }
 
 TEST_F(StorageBackendTest, BucketWatermarkEvictionNoopsWhenPolicyIsNone) {

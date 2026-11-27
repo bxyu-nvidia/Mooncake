@@ -1,6 +1,7 @@
 #pragma once
 #include "offload_metrics.h"
 #include "bucket_disk_usage.h"
+#include "disk_watermark_eviction.h"
 
 #include <glog/logging.h>
 
@@ -23,6 +24,10 @@
 #include "types.h"
 
 namespace mooncake {
+namespace test {
+class StorageBackendTest;
+}
+
 struct FileRecord {
     std::string path;
     uint64_t size;
@@ -437,6 +442,13 @@ class StorageBackendInterface {
                             double /* low_watermark_ratio */,
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
+    }
+
+    // nullopt means no unfinished watermark cycle. Otherwise the heartbeat
+    // thread can continue bounded passes without another master heartbeat.
+    virtual std::optional<std::chrono::milliseconds>
+    DiskWatermarkEvictionRetryDelay() const {
+        return std::nullopt;
     }
 
     std::shared_ptr<OffloadMetrics> offload_metrics_;
@@ -1026,7 +1038,12 @@ class BucketStorageBackend : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    std::optional<std::chrono::milliseconds> DiskWatermarkEvictionRetryDelay()
+        const override;
+
    private:
+    friend class test::StorageBackendTest;
+
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1098,6 +1115,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         int64_t evicted_size = 0;
         int64_t write_size = 0;
         int64_t physical_write_size = 0;
+        bool readers_blocked = false;
     };
 
     /**
@@ -1110,7 +1128,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
         int64_t required_size, const std::vector<std::string>& write_keys = {},
-        int64_t physical_write_size = 0);
+        int64_t physical_write_size = 0, bool avoid_readers = false);
 
     void RestorePreparedEviction(PendingEviction&& pending);
 
@@ -1206,6 +1224,7 @@ class BucketStorageBackend : public StorageBackendInterface {
                 file_storage_config_.disk_eviction_high_watermark_ratio,
                 file_storage_config_.disk_eviction_low_watermark_ratio);
     }
+    DiskWatermarkEviction disk_watermark_eviction_ GUARDED_BY(mutex_);
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;

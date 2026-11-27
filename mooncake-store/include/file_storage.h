@@ -158,11 +158,12 @@ class FileStorage {
      * 1. Sends object status (e.g., access frequency, size) to the master via
      * client.
      * 2. Receives feedback on which objects should be offloaded.
-     * 3. Triggers asynchronous offloading of pending objects.
+     * 3. Runs a bounded disk-watermark pass before each offload bucket.
      * 4. If offload work was returned, pulls and processes any pending L2->L1
      *    promotion tasks queued by the master (mirror of step 1+2 in the
      *    reverse direction).
-     * 5. Runs proactive local-disk watermark eviction.
+     * 5. Runs a final watermark pass; unfinished cleanup continues between
+     *    heartbeat ticks on the same thread.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
@@ -181,7 +182,9 @@ class FileStorage {
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
-    tl::expected<void, ErrorCode> RunDiskWatermarkEviction();
+    void RunDiskWatermarkEviction();
+
+    void WaitForNextHeartbeat();
 
     tl::expected<void, ErrorCode> NotifyEvictedDiskReplicas(
         const std::vector<std::string>& evicted_keys);

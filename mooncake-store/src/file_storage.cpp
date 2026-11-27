@@ -227,8 +227,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                   << "s, running is: " << heartbeat_running_.load();
         while (heartbeat_running_.load()) {
             Heartbeat();
-            std::this_thread::sleep_for(
-                std::chrono::seconds(config_.heartbeat_interval_seconds));
+            WaitForNextHeartbeat();
         }
     });
     client_buffer_gc_running_.store(true);
@@ -416,6 +415,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::optional<ErrorCode> abort_error;
 
     for (const auto& keys : buckets_keys) {
+        // Keep cleanup moving before and during a potentially multi-minute
+        // offload batch. Each call does at most one bounded eviction pass.
+        RunDiskWatermarkEviction();
         int64_t bucket_bytes = 0;
         int64_t bucket_objects = 0;
         for (const auto& key : keys) {
@@ -676,9 +678,10 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
     return {};
 }
 
-tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
-    if (!config_.enable_disk_watermark_eviction) {
-        return {};
+void FileStorage::RunDiskWatermarkEviction() {
+    if (!config_.enable_disk_watermark_eviction || draining_.load() ||
+        metadata_resync_pending_.load()) {
+        return;
     }
 
     auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
@@ -688,13 +691,34 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
             return NotifyEvictedDiskReplicas(evicted_keys);
         });
     if (!eviction_result) {
-        return tl::make_unexpected(eviction_result.error());
-    }
-    if (!eviction_result.value().empty()) {
+        LOG(WARNING) << "Disk watermark eviction failed: "
+                     << eviction_result.error();
+    } else if (!eviction_result.value().empty()) {
         LOG(INFO) << "Disk watermark eviction removed "
                   << eviction_result.value().size() << " LOCAL_DISK key(s)";
     }
-    return {};
+}
+
+void FileStorage::WaitForNextHeartbeat() {
+    using Clock = std::chrono::steady_clock;
+    const auto deadline =
+        Clock::now() + std::chrono::seconds(config_.heartbeat_interval_seconds);
+    while (heartbeat_running_.load() && Clock::now() < deadline) {
+        std::optional<std::chrono::milliseconds> retry;
+        if (config_.enable_disk_watermark_eviction && !draining_.load() &&
+            !metadata_resync_pending_.load()) {
+            retry = storage_backend_->DiskWatermarkEvictionRetryDelay();
+        }
+        // Yield between successful passes, honor blocked-pass backoff, and
+        // remain responsive to shutdown when there is no maintenance work.
+        const auto delay =
+            std::max(std::chrono::milliseconds(10),
+                     retry.value_or(std::chrono::milliseconds(100)));
+        std::this_thread::sleep_until(std::min(deadline, Clock::now() + delay));
+        if (retry && heartbeat_running_.load() && Clock::now() < deadline) {
+            RunDiskWatermarkEviction();
+        }
+    }
 }
 
 tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
@@ -843,6 +867,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "
                        << offload_result.error();
+            RunDiskWatermarkEviction();
             return offload_result;
         }
     }
@@ -858,11 +883,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // Proactive disk watermarks keep LOCAL_DISK usage below the configured
     // low watermark even when no new write arrives to trigger reactive
     // eviction.
-    auto disk_eviction_result = RunDiskWatermarkEviction();
-    if (!disk_eviction_result) {
-        LOG(WARNING) << "Disk watermark eviction failed: "
-                     << disk_eviction_result.error();
-    }
+    RunDiskWatermarkEviction();
     return {};
 }
 
